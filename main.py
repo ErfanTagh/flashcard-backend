@@ -15,8 +15,8 @@ app = Flask(__name__)
 
 
 redis = redis.Redis(
-    host='localhost',
-    port='6379', password="3414", charset="utf-8", decode_responses=True)
+    host='redis',
+    port='6379',  charset="utf-8", decode_responses=True)
 
 key = "hashexample"
 entry = redis.hgetall("hashexample")
@@ -130,12 +130,12 @@ def requires_auth(f):
     return decorated
 
 
-@app.route('/words', methods=['GET'])
+@app.route('/api/words', methods=['GET'])
 def allwords():
     return Response(json.dumps(redis.hgetall(key)), mimetype='application/json')
 
 
-@app.route('/words/rand/<token>', methods=['GET'])
+@app.route('/api/words/rand/<token>', methods=['GET'])
 def getwordrand(token):
     key = token
     print("token" + key)
@@ -150,7 +150,7 @@ def getwordrand(token):
         return json.dumps(res)
 
 
-@app.route('/sendwords', methods=['POST'])
+@app.route('/api/sendwords', methods=['POST'])
 def send_word():
     data = request.json
     token = data['token']
@@ -169,14 +169,14 @@ def send_word():
     return {"status": 200}
 
 
-@app.route('/token', methods=['POST'])
+@app.route('/api/token', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
 @requires_auth
 def send_token():
     return {"status": 200}
 
 
-@app.route('/delword/<word>', methods=['DELETE'])
+@app.route('/api/delword/<word>', methods=['DELETE'])
 def del_word(word):
     data = request.json
     print(data)
@@ -191,7 +191,7 @@ def del_word(word):
     return {"status": 200}
 
 
-@app.route('/editword', methods=['POST'])
+@app.route('/api/editword', methods=['POST'])
 def edit_word():
     data = request.json
 
