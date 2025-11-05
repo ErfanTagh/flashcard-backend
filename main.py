@@ -169,6 +169,9 @@ def send_word():
         return {"status": 500, "error": "Database not connected"}
     
     data = request.json
+    if not data or 'token' not in data or 'word' not in data or 'ans' not in data:
+        return {"status": 400, "error": "Missing required fields"}
+    
     token = data['token']
     word = data['word']
     ans = data['ans']
@@ -191,6 +194,13 @@ def send_word():
                 {'user_email': token},
                 {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
             )
+        else:
+            # Word already exists, update it
+            cards[word] = ans
+            flashcards_collection.update_one(
+                {'user_email': token},
+                {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+            )
     
     return {"status": 200}
 
@@ -208,6 +218,9 @@ def del_word(word):
         return {"status": 500, "error": "Database not connected"}
     
     data = request.json
+    if not data or 'token' not in data:
+        return {"status": 400, "error": "Missing token in request body"}
+    
     token = data['token']
     
     user_doc = flashcards_collection.find_one({'user_email': token})
@@ -219,8 +232,11 @@ def del_word(word):
                 {'user_email': token},
                 {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
             )
+            return {"status": 200}
+        else:
+            return {"status": 404, "error": "Word not found"}
     
-    return {"status": 200}
+    return {"status": 404, "error": "User not found"}
 
 
 @app.route('/api/editword', methods=['POST'])
@@ -229,6 +245,9 @@ def edit_word():
         return {"status": 500, "error": "Database not connected"}
     
     data = request.json
+    if not data or 'token' not in data or 'oldword' not in data or 'word' not in data or 'ans' not in data:
+        return {"status": 400, "error": "Missing required fields"}
+    
     token = data['token']
     oldWord = data['oldword']
     word = data['word']
@@ -236,12 +255,12 @@ def edit_word():
     
     user_doc = flashcards_collection.find_one({'user_email': token})
     if not user_doc or 'cards' not in user_doc:
-        return {"status": 404}
+        return {"status": 404, "error": "User not found"}
     
     cards = user_doc['cards']
     
     if word in cards:
-        # Update existing word
+        # Update existing word (including review status updates)
         cards[word] = ans
         flashcards_collection.update_one(
             {'user_email': token},
@@ -249,7 +268,7 @@ def edit_word():
         )
         return {"status": 200}
     elif oldWord in cards:
-        # Rename word
+        # Rename word (update term name)
         cards[word] = ans
         del cards[oldWord]
         flashcards_collection.update_one(
@@ -258,7 +277,7 @@ def edit_word():
         )
         return {"status": 200}
     
-    return {"status": 404}
+    return {"status": 404, "error": "Word not found"}
 
 
 if __name__ == '__main__':
