@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+    mongodb:
+        image: mongo:7
+        container_name: flashcard-mongodb
+        ports:
+            - "27017:27017"
+        volumes:
+            - mongodb_data:/data/db
+        networks:
+            - flashcard-network
+        environment:
+            - MONGO_INITDB_ROOT_USERNAME=admin
+            - MONGO_INITDB_ROOT_PASSWORD=password
+
+    backend:
+        build: .
+        container_name: flashcard-backend
+        ports:
+            - "5000:5000"
+        environment:
+            - MONGO_HOST=mongodb
+            - MONGO_PORT=27017
+            - MONGO_DATABASE=flashcards
+            - MONGO_USERNAME=admin
+            - MONGO_PASSWORD=password
+        depends_on:
+            - mongodb
+        networks:
+            - flashcard-network
+        volumes:
+            - ./:/app
+
+    frontend:
+        build: ../flashcard-frontend
+        container_name: flashcard-frontend
+        ports:
+            - "3000:80"
+        depends_on:
+            - backend
+        networks:
+            - flashcard-network
+
+volumes:
+    mongodb_data:
+
+
+networks:
+    flashcard-network:
+        driver: bridge

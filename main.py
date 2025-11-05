@@ -1,32 +1,38 @@
 import os
-import redis
 import json
-from flask import Flask, Response, request
-import json
+from flask import Flask, Response, request, jsonify
 from bson.objectid import ObjectId
-import json
 from datetime import datetime
 import random
 from flask_cors import cross_origin
+from pymongo import MongoClient
+from functools import wraps
+from six.moves.urllib.request import urlopen
+from jose import jwt
 
 app = Flask(__name__)
 
+# MongoDB connection
+mongo_host = os.environ.get('MONGO_HOST', 'localhost')
+mongo_port = os.environ.get('MONGO_PORT', '27017')
+mongo_database = os.environ.get('MONGO_DATABASE', 'flashcards')
+mongo_username = os.environ.get('MONGO_USERNAME', '')
+mongo_password = os.environ.get('MONGO_PASSWORD', '')
 
+# Build connection string
+if mongo_username and mongo_password:
+    mongo_uri = f'mongodb://{mongo_username}:{mongo_password}@{mongo_host}:{mongo_port}/{mongo_database}?authSource=admin'
+else:
+    mongo_uri = f'mongodb://{mongo_host}:{mongo_port}/'
 
-
-redis = redis.Redis(
-    host='redis',
-    port='6379',  charset="utf-8", decode_responses=True)
-
-key = "hashexample"
-entry = redis.hgetall("hashexample")
-
-import json
-from six.moves.urllib.request import urlopen
-from functools import wraps
-
-from flask import Flask, request, jsonify, _request_ctx_stack
-from jose import jwt
+try:
+    client = MongoClient(mongo_uri)
+    db = client[mongo_database]
+    flashcards_collection = db.flashcards
+    print(f"Connected to MongoDB at {mongo_host}:{mongo_port}")
+except Exception as e:
+    print(f"Error connecting to MongoDB: {e}")
+    flashcards_collection = None
 
 AUTH0_DOMAIN = 'dev-43bumhcy.us.auth0.com'
 API_AUDIENCE = 'recallcards'
@@ -122,7 +128,7 @@ def requires_auth(f):
                                      "Unable to parse authentication"
                                      " token."}, 401)
 
-            _request_ctx_stack.top.current_user = payload
+            request.current_user = payload
             return f(*args, **kwargs)
         raise AuthError({"code": "invalid_header",
                          "description": "Unable to find appropriate key"}, 401)
@@ -132,40 +138,60 @@ def requires_auth(f):
 
 @app.route('/api/words', methods=['GET'])
 def allwords():
-    return Response(json.dumps(redis.hgetall(key)), mimetype='application/json')
+    if flashcards_collection is None:
+        return Response(json.dumps({}), mimetype='application/json')
+    
+    all_cards = {}
+    for document in flashcards_collection.find():
+        if 'user_email' in document and 'cards' in document:
+            all_cards[document['user_email']] = document['cards']
+    
+    return Response(json.dumps(all_cards), mimetype='application/json')
 
 
 @app.route('/api/words/rand/<token>', methods=['GET'])
 def getwordrand(token):
-    key = token
-    print("token" + key)
-    dataaa = redis.hgetall(key)
-    if len(dataaa) == 0:
-
+    if flashcards_collection is None:
         return json.dumps(["You Don't Have Anything to Memorize ", "Please Add Cards!"])
-
-    else:
-        res = random.choice(list(dataaa.items()))
-
-        return json.dumps(res)
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc or 'cards' not in user_doc or len(user_doc['cards']) == 0:
+        return json.dumps(["You Don't Have Anything to Memorize ", "Please Add Cards!"])
+    
+    cards = user_doc['cards']
+    res = random.choice(list(cards.items()))
+    return json.dumps(res)
 
 
 @app.route('/api/sendwords', methods=['POST'])
 def send_word():
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
     data = request.json
     token = data['token']
-    key = token
-
-    entry = redis.hgetall(token)
-
     word = data['word']
     ans = data['ans']
-
-    if word not in entry.keys():
-        entry[word] = ans
-
-        redis.hset(key, mapping=entry)
-
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    
+    if not user_doc:
+        # Create new user document
+        flashcards_collection.insert_one({
+            'user_email': token,
+            'cards': {word: ans},
+            'created_at': datetime.utcnow()
+        })
+    else:
+        # Update existing user document
+        cards = user_doc.get('cards', {})
+        if word not in cards:
+            cards[word] = ans
+            flashcards_collection.update_one(
+                {'user_email': token},
+                {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+            )
+    
     return {"status": 200}
 
 
@@ -178,46 +204,60 @@ def send_token():
 
 @app.route('/api/delword/<word>', methods=['DELETE'])
 def del_word(word):
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
     data = request.json
-    print(data)
     token = data['token']
-    key = token
-    entry = redis.hgetall(token)
-
-    if word in entry.keys():
-        redis.hdel(key, word)
-        del entry[word]
-
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if user_doc and 'cards' in user_doc:
+        cards = user_doc['cards']
+        if word in cards:
+            del cards[word]
+            flashcards_collection.update_one(
+                {'user_email': token},
+                {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+            )
+    
     return {"status": 200}
 
 
 @app.route('/api/editword', methods=['POST'])
 def edit_word():
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
     data = request.json
-
     token = data['token']
-    key = token
-    entry = redis.hgetall(token)
-
     oldWord = data['oldword']
     word = data['word']
     ans = data['ans']
-
-    print(ans + " top ans")
-
-    if word in entry.keys():
-        print(ans + " first if")
-        entry[word] = ans
-        redis.hset(key, mapping=entry)
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc or 'cards' not in user_doc:
+        return {"status": 404}
+    
+    cards = user_doc['cards']
+    
+    if word in cards:
+        # Update existing word
+        cards[word] = ans
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+        )
         return {"status": 200}
-
-    elif oldWord in entry.keys():
-        print(ans + " second if")
-        redis.hdel(key, oldWord)
-        del entry[oldWord]
-        entry[word] = ans
-        redis.hset(key, mapping=entry)
+    elif oldWord in cards:
+        # Rename word
+        cards[word] = ans
+        del cards[oldWord]
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+        )
         return {"status": 200}
+    
     return {"status": 404}
 
 
