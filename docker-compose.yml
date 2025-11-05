@@ -36,7 +36,11 @@ services:
         build: ../flashcard-frontend
         container_name: flashcard-frontend
         ports:
-            - "3000:80"
+            - "80:80"
+            - "443:443"
+        volumes:
+            - /etc/letsencrypt/live/recallcards.net/fullchain.pem:/etc/nginx/fullchain.pem:ro
+            - /etc/letsencrypt/live/recallcards.net/privkey.pem:/etc/nginx/privkey.pem:ro
         depends_on:
             - backend
         networks:
