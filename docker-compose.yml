@@ -15,8 +15,8 @@ services:
     backend:
         build: .
         container_name: flashcard-backend
-        expose:
-            - "5000"
+        ports:
+            - "5000:5000"
         environment:
             - MONGO_HOST=mongodb
             - MONGO_PORT=27017

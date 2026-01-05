@@ -175,32 +175,33 @@ def send_word():
     token = data['token']
     word = data['word']
     ans = data['ans']
+    collection_name = data.get('collection', 'Default')  # Default collection if not specified
     
     user_doc = flashcards_collection.find_one({'user_email': token})
     
     if not user_doc:
-        # Create new user document
+        # Create new user document with collections structure
+        collections = {collection_name: {word: ans}}
         flashcards_collection.insert_one({
             'user_email': token,
-            'cards': {word: ans},
+            'collections': collections,
+            'default_collection': collection_name,
             'created_at': datetime.utcnow()
         })
     else:
-        # Update existing user document
-        cards = user_doc.get('cards', {})
-        if word not in cards:
-            cards[word] = ans
-            flashcards_collection.update_one(
-                {'user_email': token},
-                {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
-            )
-        else:
-            # Word already exists, update it
-            cards[word] = ans
-            flashcards_collection.update_one(
-                {'user_email': token},
-                {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
-            )
+        # Migrate if needed
+        collections = migrate_user_to_collections(user_doc)
+        
+        # Initialize collection if it doesn't exist
+        if collection_name not in collections:
+            collections[collection_name] = {}
+        
+        # Add or update the word
+        collections[collection_name][word] = ans
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
+        )
     
     return {"status": 200}
 
@@ -278,6 +279,257 @@ def edit_word():
         return {"status": 200}
     
     return {"status": 404, "error": "Word not found"}
+
+
+# Collections API endpoints
+def migrate_user_to_collections(user_doc):
+    """Migrate old 'cards' structure to 'collections' structure"""
+    if 'cards' in user_doc and 'collections' not in user_doc:
+        collections = {'Default': user_doc['cards']}
+        flashcards_collection.update_one(
+            {'user_email': user_doc['user_email']},
+            {'$set': {'collections': collections, 'default_collection': 'Default'},
+             '$unset': {'cards': ''}}
+        )
+        # Refresh the document
+        user_doc['collections'] = collections
+        user_doc.pop('cards', None)
+        return collections
+    elif 'collections' in user_doc:
+        return user_doc['collections']
+    else:
+        # No cards or collections, create empty Default collection
+        collections = {'Default': {}}
+        flashcards_collection.update_one(
+            {'user_email': user_doc['user_email']},
+            {'$set': {'collections': collections, 'default_collection': 'Default'}},
+            upsert=True
+        )
+        return collections
+
+
+@app.route('/api/collections/<token>', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def get_collections(token):
+    """Get all collections for a user"""
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        # Return empty structure for new users
+        return Response(json.dumps({'collections': ['Default'], 'default_collection': 'Default'}), mimetype='application/json')
+    
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    # Refresh user_doc to get updated structure
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    
+    collection_names = list(collections.keys())
+    default_collection = user_doc.get('default_collection', 'Default') if user_doc else 'Default'
+    
+    return Response(json.dumps({
+        'collections': collection_names,
+        'default_collection': default_collection
+    }), mimetype='application/json')
+
+
+@app.route('/api/collections', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def create_collection():
+    """Create a new collection"""
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
+    data = request.json
+    if not data or 'token' not in data or 'collection_name' not in data:
+        return {"status": 400, "error": "Missing required fields"}
+    
+    token = data['token']
+    collection_name = data['collection_name'].strip()
+    
+    if not collection_name:
+        return {"status": 400, "error": "Collection name cannot be empty"}
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    
+    if not user_doc:
+        # Create new user with the collection
+        collections = {collection_name: {}}
+        flashcards_collection.insert_one({
+            'user_email': token,
+            'collections': collections,
+            'default_collection': collection_name,
+            'created_at': datetime.utcnow()
+        })
+    else:
+        # Migrate if needed
+        collections = migrate_user_to_collections(user_doc)
+        
+        if collection_name in collections:
+            return {"status": 400, "error": "Collection already exists"}
+        
+        collections[collection_name] = {}
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
+        )
+    
+    return {"status": 200}
+
+
+@app.route('/api/collections/<collection_name>', methods=['DELETE'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def delete_collection(collection_name):
+    """Delete a collection"""
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
+    data = request.json
+    if not data or 'token' not in data:
+        return {"status": 400, "error": "Missing token in request body"}
+    
+    token = data['token']
+    
+    if collection_name == 'Default':
+        return {"status": 400, "error": "Cannot delete Default collection"}
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return {"status": 404, "error": "User not found"}
+    
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    if collection_name not in collections:
+        return {"status": 404, "error": "Collection not found"}
+    
+    # Delete the collection
+    del collections[collection_name]
+    
+    # If it was the default collection, set Default as default
+    default_collection = user_doc.get('default_collection', 'Default')
+    if default_collection == collection_name:
+        default_collection = 'Default'
+    
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'collections': collections, 'default_collection': default_collection, 'updated_at': datetime.utcnow()}}
+    )
+    
+    return {"status": 200}
+
+
+@app.route('/api/collections/default', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def set_default_collection():
+    """Set the default collection"""
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
+    data = request.json
+    if not data or 'token' not in data or 'collection_name' not in data:
+        return {"status": 400, "error": "Missing required fields"}
+    
+    token = data['token']
+    collection_name = data['collection_name']
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return {"status": 404, "error": "User not found"}
+    
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    if collection_name not in collections:
+        return {"status": 404, "error": "Collection not found"}
+    
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'default_collection': collection_name, 'updated_at': datetime.utcnow()}}
+    )
+    
+    return {"status": 200}
+
+
+@app.route('/api/collections/<old_collection_name>/rename', methods=['PUT'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def rename_collection(old_collection_name):
+    """Rename a collection"""
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
+    data = request.json
+    if not data or 'token' not in data or 'new_collection_name' not in data:
+        return {"status": 400, "error": "Missing required fields"}
+    
+    token = data['token']
+    new_collection_name = data['new_collection_name'].strip()
+    
+    if not new_collection_name:
+        return {"status": 400, "error": "Collection name cannot be empty"}
+    
+    if old_collection_name == 'Default':
+        return {"status": 400, "error": "Cannot rename Default collection"}
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return {"status": 404, "error": "User not found"}
+    
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    if old_collection_name not in collections:
+        return {"status": 404, "error": "Collection not found"}
+    
+    if new_collection_name in collections:
+        return {"status": 400, "error": "A collection with that name already exists"}
+    
+    # Rename the collection
+    collections[new_collection_name] = collections[old_collection_name]
+    del collections[old_collection_name]
+    
+    # Update default_collection if it was the renamed collection
+    default_collection = user_doc.get('default_collection', 'Default')
+    if default_collection == old_collection_name:
+        default_collection = new_collection_name
+    
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'collections': collections, 'default_collection': default_collection, 'updated_at': datetime.utcnow()}}
+    )
+    
+    return {"status": 200}
+
+
+@app.route('/api/collections/<token>/stats', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def get_collection_stats(token):
+    """Get statistics for all collections (card counts)"""
+    if flashcards_collection is None:
+        return {"status": 500, "error": "Database not connected"}
+    
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return Response(json.dumps({'stats': {}}), mimetype='application/json')
+    
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    stats = {}
+    for collection_name, cards in collections.items():
+        stats[collection_name] = len(cards)
+    
+    return Response(json.dumps({'stats': stats}), mimetype='application/json')
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_error(error):
+    app.logger.error(f"An unexpected error occurred: {error}", exc_info=True)
+    response = jsonify({"status": 500, "error": "An unexpected error occurred."})
+    response.status_code = 500
+    return response
 
 
 if __name__ == '__main__':

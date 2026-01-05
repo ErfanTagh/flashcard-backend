@@ -34,17 +34,17 @@ jobs:
             git pull origin main || git pull origin master
 
             # Rebuild backend service
-            sudo docker compose build --no-cache backend
+            docker compose build --no-cache backend
 
             # Stop old container and start new one
-            sudo docker compose up -d --force-recreate backend
+            docker compose up -d --force-recreate backend
 
             # Verify container is running
-            sudo docker compose ps backend
+            docker compose ps backend
 
             # Restart nginx (adjust command based on your nginx setup)
-            if sudo docker ps | grep -q nginx; then
-              sudo docker restart nginx
+            if docker ps | grep -q nginx; then
+              docker restart nginx
             else
               echo "Warning: nginx container not found, skipping restart"
             fi
