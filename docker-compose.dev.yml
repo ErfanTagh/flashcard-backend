@@ -33,22 +33,32 @@ services:
     frontend:
         build:
             context: ../flashcard-frontend
+            dockerfile: Dockerfile.dev
             args:
                 - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
                 - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
                 - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
-        container_name: flashcard-frontend
+        container_name: flashcard-frontend-dev
         ports:
-            - "3000:80"
+            - "3000:3000"
+        environment:
+            - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
+            - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
+            - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
         depends_on:
             - backend
         networks:
             - web
+        volumes:
+            - ../flashcard-frontend:/app
+            - /app/node_modules
+        stdin_open: true
+        tty: true
 
 volumes:
     mongodb_data:
 
-
 networks:
     web:
         external: true
+

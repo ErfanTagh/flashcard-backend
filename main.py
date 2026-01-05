@@ -137,40 +137,76 @@ def requires_auth(f):
 
 
 @app.route('/api/words', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
 def allwords():
     if flashcards_collection is None:
         return Response(json.dumps({}), mimetype='application/json')
     
     all_cards = {}
     for document in flashcards_collection.find():
-        if 'user_email' in document and 'cards' in document:
-            all_cards[document['user_email']] = document['cards']
+        if 'user_email' in document:
+            # Migrate if needed
+            collections = migrate_user_to_collections(document)
+            all_cards[document['user_email']] = collections
     
     return Response(json.dumps(all_cards), mimetype='application/json')
 
 
 @app.route('/api/words/rand/<token>', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
 def getwordrand(token):
     if flashcards_collection is None:
         return json.dumps(["You Don't Have Anything to Memorize ", "Please Add Cards!"])
     
+    # Get collection from query parameter, default to 'Default'
+    collection_name = request.args.get('collection', 'Default')
+    # Get index from query parameter (0-based)
+    index = request.args.get('index', None)
+    
     user_doc = flashcards_collection.find_one({'user_email': token})
-    if not user_doc or 'cards' not in user_doc or len(user_doc['cards']) == 0:
+    if not user_doc:
         return json.dumps(["You Don't Have Anything to Memorize ", "Please Add Cards!"])
     
-    cards = user_doc['cards']
-    res = random.choice(list(cards.items()))
-    return json.dumps(res)
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    # Get cards from the specified collection
+    if collection_name not in collections or len(collections[collection_name]) == 0:
+        return json.dumps(["You Don't Have Anything to Memorize ", "Please Add Cards!"])
+    
+    cards = collections[collection_name]
+    # Convert to list to maintain insertion order (Python 3.7+ dicts maintain order)
+    cards_list = list(cards.items())
+    
+    if index is not None:
+        try:
+            index = int(index)
+            if 0 <= index < len(cards_list):
+                res = cards_list[index]
+                return json.dumps(res)
+            else:
+                # Index out of range, return first card
+                res = cards_list[0]
+                return json.dumps(res)
+        except ValueError:
+            # Invalid index, return first card
+            res = cards_list[0]
+            return json.dumps(res)
+    else:
+        # No index specified, return first card
+        res = cards_list[0]
+        return json.dumps(res)
 
 
 @app.route('/api/sendwords', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
 def send_word():
     if flashcards_collection is None:
-        return {"status": 500, "error": "Database not connected"}
+        return jsonify({"status": 500, "error": "Database not connected"})
     
     data = request.json
     if not data or 'token' not in data or 'word' not in data or 'ans' not in data:
-        return {"status": 400, "error": "Missing required fields"}
+        return jsonify({"status": 400, "error": "Missing required fields"})
     
     token = data['token']
     word = data['word']
@@ -214,71 +250,89 @@ def send_token():
 
 
 @app.route('/api/delword/<word>', methods=['DELETE'])
+@cross_origin(headers=["Content-Type", "Authorization"])
 def del_word(word):
     if flashcards_collection is None:
-        return {"status": 500, "error": "Database not connected"}
+        return jsonify({"status": 500, "error": "Database not connected"})
     
     data = request.json
     if not data or 'token' not in data:
-        return {"status": 400, "error": "Missing token in request body"}
+        return jsonify({"status": 400, "error": "Missing token in request body"})
     
     token = data['token']
+    collection_name = data.get('collection', 'Default')
     
     user_doc = flashcards_collection.find_one({'user_email': token})
-    if user_doc and 'cards' in user_doc:
-        cards = user_doc['cards']
-        if word in cards:
-            del cards[word]
-            flashcards_collection.update_one(
-                {'user_email': token},
-                {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
-            )
-            return {"status": 200}
-        else:
-            return {"status": 404, "error": "Word not found"}
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"})
     
-    return {"status": 404, "error": "User not found"}
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    # Initialize collection if it doesn't exist
+    if collection_name not in collections:
+        return jsonify({"status": 404, "error": "Collection not found"})
+    
+    cards = collections[collection_name]
+    if word in cards:
+        del cards[word]
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
+        )
+        return jsonify({"status": 200})
+    else:
+        return jsonify({"status": 404, "error": "Word not found"})
 
 
 @app.route('/api/editword', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
 def edit_word():
     if flashcards_collection is None:
-        return {"status": 500, "error": "Database not connected"}
+        return jsonify({"status": 500, "error": "Database not connected"})
     
     data = request.json
     if not data or 'token' not in data or 'oldword' not in data or 'word' not in data or 'ans' not in data:
-        return {"status": 400, "error": "Missing required fields"}
+        return jsonify({"status": 400, "error": "Missing required fields"})
     
     token = data['token']
     oldWord = data['oldword']
     word = data['word']
     ans = data['ans']
+    collection_name = data.get('collection', 'Default')
     
     user_doc = flashcards_collection.find_one({'user_email': token})
-    if not user_doc or 'cards' not in user_doc:
-        return {"status": 404, "error": "User not found"}
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"})
     
-    cards = user_doc['cards']
+    # Migrate if needed
+    collections = migrate_user_to_collections(user_doc)
+    
+    # Initialize collection if it doesn't exist
+    if collection_name not in collections:
+        collections[collection_name] = {}
+    
+    cards = collections[collection_name]
     
     if word in cards:
         # Update existing word (including review status updates)
         cards[word] = ans
         flashcards_collection.update_one(
             {'user_email': token},
-            {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
         )
-        return {"status": 200}
+        return jsonify({"status": 200})
     elif oldWord in cards:
         # Rename word (update term name)
         cards[word] = ans
         del cards[oldWord]
         flashcards_collection.update_one(
             {'user_email': token},
-            {'$set': {'cards': cards, 'updated_at': datetime.utcnow()}}
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
         )
-        return {"status": 200}
+        return jsonify({"status": 200})
     
-    return {"status": 404, "error": "Word not found"}
+    return jsonify({"status": 404, "error": "Word not found"})
 
 
 # Collections API endpoints
