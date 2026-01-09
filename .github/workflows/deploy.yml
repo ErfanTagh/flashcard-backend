@@ -30,8 +30,10 @@ jobs:
 
             cd "$BACKEND_DIR"
 
-            # Pull latest changes
-            git pull origin main || git pull origin master
+            # Fetch latest changes and reset to match remote exactly
+            # This discards any local changes to match the repository
+            git fetch origin
+            git reset --hard origin/main || git reset --hard origin/master
 
             # Ensure Docker network exists
             docker network create web 2>/dev/null || true
