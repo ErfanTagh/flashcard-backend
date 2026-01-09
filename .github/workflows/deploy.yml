@@ -33,6 +33,9 @@ jobs:
             # Pull latest changes
             git pull origin main || git pull origin master
 
+            # Ensure Docker network exists
+            docker network create web 2>/dev/null || true
+
             # Rebuild backend service
             docker compose build --no-cache backend
 
@@ -42,11 +45,7 @@ jobs:
             # Verify container is running
             docker compose ps backend
 
-            # Restart nginx (adjust command based on your nginx setup)
-            if docker ps | grep -q nginx; then
-              docker restart nginx
-            else
-              echo "Warning: nginx container not found, skipping restart"
-            fi
+            # Show logs if there are any issues
+            docker compose logs --tail=20 backend
 
             echo "Backend deployment completed successfully!"
