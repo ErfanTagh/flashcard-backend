@@ -39,6 +39,51 @@ AUTH0_DOMAIN = 'dev-43bumhcy.us.auth0.com'
 API_AUDIENCE = 'recallcards'
 ALGORITHMS = ["RS256"]
 
+# Cards were originally stored as a bare definition string, with "needs review"
+# encoded by appending this sentinel to that string. They are now stored as
+# documents; the sentinel is still understood on read, and still emitted by the
+# legacy endpoints so older clients keep working.
+REVIEW_KEY = "FFFLASHBACKCARDS"
+
+
+def _default_card(definition):
+    return {
+        "definition": definition,
+        "seen": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "needs_review": False,
+        "last_reviewed": None,
+    }
+
+
+def _normalise_card(value):
+    """Coerce whatever is stored for a card into the structured shape."""
+    if isinstance(value, dict):
+        card = _default_card(value.get("definition", ""))
+        for key in card:
+            if key in value:
+                card[key] = value[key]
+        return card
+
+    definition = value if isinstance(value, str) else ""
+    needs_review = definition.endswith(REVIEW_KEY)
+    if needs_review:
+        definition = definition[: -len(REVIEW_KEY)]
+
+    card = _default_card(definition)
+    card["needs_review"] = needs_review
+    return card
+
+
+def _legacy_value(card):
+    """The definition-plus-sentinel string that older clients expect."""
+    return card["definition"] + (REVIEW_KEY if card["needs_review"] else "")
+
+
+def _card_payload(term, card):
+    return {"term": term, **card}
+
 
 # Error handler
 class AuthError(Exception):
@@ -154,7 +199,11 @@ def allwords():
         return Response(json.dumps({}), mimetype='application/json')
 
     collections = migrate_user_to_collections(user_doc)
-    return Response(json.dumps({email: collections}), mimetype='application/json')
+    legacy = {
+        name: {term: _legacy_value(card) for term, card in cards.items()}
+        for name, cards in collections.items()
+    }
+    return Response(json.dumps({email: legacy}), mimetype='application/json')
 
 
 @app.route('/api/words/rand/<token>', methods=['GET'])
@@ -181,26 +230,18 @@ def getwordrand(token):
     
     cards = collections[collection_name]
     # Convert to list to maintain insertion order (Python 3.7+ dicts maintain order)
-    cards_list = list(cards.items())
-    
+    cards_list = [(term, _legacy_value(card)) for term, card in cards.items()]
+
+    position = 0
     if index is not None:
         try:
             index = int(index)
             if 0 <= index < len(cards_list):
-                res = cards_list[index]
-                return json.dumps(res)
-            else:
-                # Index out of range, return first card
-                res = cards_list[0]
-                return json.dumps(res)
+                position = index
         except ValueError:
-            # Invalid index, return first card
-            res = cards_list[0]
-            return json.dumps(res)
-    else:
-        # No index specified, return first card
-        res = cards_list[0]
-        return json.dumps(res)
+            pass
+
+    return json.dumps(list(cards_list[position]))
 
 
 @app.route('/api/sendwords', methods=['POST'])
@@ -222,7 +263,7 @@ def send_word():
     
     if not user_doc:
         # Create new user document with collections structure
-        collections = {collection_name: {word: ans}}
+        collections = {collection_name: {word: _default_card(ans)}}
         flashcards_collection.insert_one({
             'user_email': token,
             'collections': collections,
@@ -232,13 +273,16 @@ def send_word():
     else:
         # Migrate if needed
         collections = migrate_user_to_collections(user_doc)
-        
+
         # Initialize collection if it doesn't exist
         if collection_name not in collections:
             collections[collection_name] = {}
-        
-        # Add or update the word
-        collections[collection_name][word] = ans
+
+        # Add or update the word, keeping any review history it already has
+        existing = collections[collection_name].get(word)
+        card = _normalise_card(existing) if existing else _default_card(ans)
+        card['definition'] = ans
+        collections[collection_name][word] = card
         flashcards_collection.update_one(
             {'user_email': token},
             {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
@@ -318,53 +362,71 @@ def edit_word():
         collections[collection_name] = {}
     
     cards = collections[collection_name]
-    
-    if word in cards:
-        # Update existing word (including review status updates)
-        cards[word] = ans
-        flashcards_collection.update_one(
-            {'user_email': token},
-            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
-        )
-        return jsonify({"status": 200})
-    elif oldWord in cards:
-        # Rename word (update term name)
-        cards[word] = ans
-        del cards[oldWord]
-        flashcards_collection.update_one(
-            {'user_email': token},
-            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
-        )
-        return jsonify({"status": 200})
-    
-    return jsonify({"status": 404, "error": "Word not found"})
+
+    source = word if word in cards else oldWord
+    if source not in cards:
+        return jsonify({"status": 404, "error": "Word not found"})
+
+    incoming = _normalise_card(ans)
+    card = _normalise_card(cards[source])
+    card['definition'] = incoming['definition']
+
+    # Review state is only changed when the caller actually asks. Editing the
+    # text of a card must not silently clear the flag on it.
+    if 'needs_review' in data:
+        card['needs_review'] = bool(data['needs_review'])
+    elif incoming['needs_review']:
+        # Older clients flag a card by appending the sentinel to the definition.
+        card['needs_review'] = True
+
+    if source != word:
+        del cards[source]
+    cards[word] = card
+
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
+    )
+    return jsonify({"status": 200})
 
 
 # Collections API endpoints
 def migrate_user_to_collections(user_doc):
-    """Migrate old 'cards' structure to 'collections' structure"""
-    if 'cards' in user_doc and 'collections' not in user_doc:
+    """Bring a user document up to the current shape.
+
+    Handles both migrations: the old top-level 'cards' dict into 'collections',
+    and bare definition strings into structured card documents. Rewrites the
+    document only when something actually changed.
+    """
+    had_legacy_cards = 'cards' in user_doc and 'collections' not in user_doc
+
+    if had_legacy_cards:
         collections = {'Default': user_doc['cards']}
-        flashcards_collection.update_one(
-            {'user_email': user_doc['user_email']},
-            {'$set': {'collections': collections, 'default_collection': 'Default'},
-             '$unset': {'cards': ''}}
-        )
-        # Refresh the document
-        user_doc['collections'] = collections
-        user_doc.pop('cards', None)
-        return collections
     elif 'collections' in user_doc:
-        return user_doc['collections']
+        collections = user_doc['collections']
     else:
-        # No cards or collections, create empty Default collection
         collections = {'Default': {}}
+
+    normalised = {
+        name: {term: _normalise_card(value) for term, value in cards.items()}
+        for name, cards in collections.items()
+    }
+
+    if normalised != collections or had_legacy_cards or 'default_collection' not in user_doc:
+        update = {'$set': {
+            'collections': normalised,
+            'default_collection': user_doc.get('default_collection', 'Default'),
+        }}
+        if had_legacy_cards:
+            update['$unset'] = {'cards': ''}
+
         flashcards_collection.update_one(
-            {'user_email': user_doc['user_email']},
-            {'$set': {'collections': collections, 'default_collection': 'Default'}},
-            upsert=True
+            {'user_email': user_doc['user_email']}, update, upsert=True
         )
-        return collections
+
+    user_doc['collections'] = normalised
+    user_doc.pop('cards', None)
+    return normalised
 
 
 @app.route('/api/collections/<token>', methods=['GET'])
@@ -581,6 +643,128 @@ def get_collection_stats(token):
         stats[collection_name] = len(cards)
     
     return Response(json.dumps({'stats': stats}), mimetype='application/json')
+
+
+@app.route('/api/cards', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def get_cards():
+    """Every card in a collection, with its review history."""
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    email = request.args.get('email')
+    if not email:
+        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+
+    collection_name = request.args.get('collection', 'Default')
+
+    user_doc = flashcards_collection.find_one({'user_email': email})
+    if not user_doc:
+        return Response(json.dumps({'cards': []}), mimetype='application/json')
+
+    collections = migrate_user_to_collections(user_doc)
+    cards = collections.get(collection_name, {})
+
+    payload = [_card_payload(term, card) for term, card in cards.items()]
+    return Response(json.dumps({'cards': payload}), mimetype='application/json')
+
+
+@app.route('/api/review', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def record_review():
+    """Record the outcome of studying one card."""
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"})
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data or 'word' not in data or 'outcome' not in data:
+        return jsonify({"status": 400, "error": "Missing required fields"})
+
+    outcome = data['outcome']
+    if outcome not in ('correct', 'incorrect'):
+        return jsonify({"status": 400, "error": "outcome must be 'correct' or 'incorrect'"})
+
+    token = data['token']
+    word = data['word']
+    collection_name = data.get('collection', 'Default')
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"})
+
+    collections = migrate_user_to_collections(user_doc)
+    cards = collections.get(collection_name)
+    if cards is None:
+        return jsonify({"status": 404, "error": "Collection not found"})
+    if word not in cards:
+        return jsonify({"status": 404, "error": "Word not found"})
+
+    card = _normalise_card(cards[word])
+    card['seen'] += 1
+    card['last_reviewed'] = datetime.utcnow().isoformat()
+    if outcome == 'correct':
+        card['correct'] += 1
+        card['needs_review'] = False
+    else:
+        card['incorrect'] += 1
+        card['needs_review'] = True
+
+    cards[word] = card
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}}
+    )
+
+    return Response(
+        json.dumps({'status': 200, 'card': _card_payload(word, card)}),
+        mimetype='application/json',
+    )
+
+
+@app.route('/api/progress', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def get_progress():
+    """Real study statistics, derived from recorded review outcomes."""
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    email = request.args.get('email')
+    if not email:
+        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+
+    collection_name = request.args.get('collection', 'Default')
+
+    empty = {'total': 0, 'studied': 0, 'unseen': 0, 'needs_review': 0,
+             'known': 0, 'attempts': 0, 'accuracy': 0, 'last_reviewed': None}
+
+    user_doc = flashcards_collection.find_one({'user_email': email})
+    if not user_doc:
+        return Response(json.dumps(empty), mimetype='application/json')
+
+    collections = migrate_user_to_collections(user_doc)
+    cards = list(collections.get(collection_name, {}).values())
+    if not cards:
+        return Response(json.dumps(empty), mimetype='application/json')
+
+    studied = sum(1 for c in cards if c['seen'] > 0)
+    needs_review = sum(1 for c in cards if c['needs_review'])
+    # "Known" means answered at least once and not currently flagged. A card you
+    # have never opened is neither known nor unknown.
+    known = sum(1 for c in cards if c['seen'] > 0 and not c['needs_review'])
+    correct = sum(c['correct'] for c in cards)
+    attempts = correct + sum(c['incorrect'] for c in cards)
+    timestamps = [c['last_reviewed'] for c in cards if c['last_reviewed']]
+
+    return Response(json.dumps({
+        'total': len(cards),
+        'studied': studied,
+        'unseen': len(cards) - studied,
+        'needs_review': needs_review,
+        'known': known,
+        'attempts': attempts,
+        'accuracy': round(correct / attempts * 100) if attempts else 0,
+        'last_reviewed': max(timestamps) if timestamps else None,
+    }), mimetype='application/json')
 
 
 @app.errorhandler(Exception)
