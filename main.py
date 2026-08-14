@@ -1,6 +1,7 @@
 import os
 import json
 from flask import Flask, Response, request, jsonify
+from werkzeug.exceptions import HTTPException
 from bson.objectid import ObjectId
 from datetime import datetime
 import random
@@ -141,15 +142,19 @@ def requires_auth(f):
 def allwords():
     if flashcards_collection is None:
         return Response(json.dumps({}), mimetype='application/json')
-    
-    all_cards = {}
-    for document in flashcards_collection.find():
-        if 'user_email' in document:
-            # Migrate if needed
-            collections = migrate_user_to_collections(document)
-            all_cards[document['user_email']] = collections
-    
-    return Response(json.dumps(all_cards), mimetype='application/json')
+
+    # Scoped to a single user. This used to iterate the whole collection and
+    # return every account's cards to any caller.
+    email = request.args.get('email')
+    if not email:
+        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+
+    user_doc = flashcards_collection.find_one({'user_email': email})
+    if not user_doc:
+        return Response(json.dumps({}), mimetype='application/json')
+
+    collections = migrate_user_to_collections(user_doc)
+    return Response(json.dumps({email: collections}), mimetype='application/json')
 
 
 @app.route('/api/words/rand/<token>', methods=['GET'])
@@ -204,7 +209,7 @@ def send_word():
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"})
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data or 'word' not in data or 'ans' not in data:
         return jsonify({"status": 400, "error": "Missing required fields"})
     
@@ -255,7 +260,7 @@ def del_word(word):
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"})
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data:
         return jsonify({"status": 400, "error": "Missing token in request body"})
     
@@ -291,7 +296,7 @@ def edit_word():
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"})
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data or 'oldword' not in data or 'word' not in data or 'ans' not in data:
         return jsonify({"status": 400, "error": "Missing required fields"})
     
@@ -396,7 +401,7 @@ def create_collection():
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data or 'collection_name' not in data:
         return {"status": 400, "error": "Missing required fields"}
     
@@ -440,7 +445,7 @@ def delete_collection(collection_name):
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data:
         return {"status": 400, "error": "Missing token in request body"}
     
@@ -482,7 +487,7 @@ def set_default_collection():
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data or 'collection_name' not in data:
         return {"status": 400, "error": "Missing required fields"}
     
@@ -514,7 +519,7 @@ def rename_collection(old_collection_name):
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
-    data = request.json
+    data = request.get_json(silent=True)
     if not data or 'token' not in data or 'new_collection_name' not in data:
         return {"status": 400, "error": "Missing required fields"}
     
@@ -580,6 +585,11 @@ def get_collection_stats(token):
 
 @app.errorhandler(Exception)
 def handle_unexpected_error(error):
+    # Without this, Flask's own 404/405/415 responses were being swallowed and
+    # re-reported as 500s, hiding the real cause from callers.
+    if isinstance(error, HTTPException):
+        return error
+
     app.logger.error(f"An unexpected error occurred: {error}", exc_info=True)
     response = jsonify({"status": 500, "error": "An unexpected error occurred."})
     response.status_code = 500
@@ -590,4 +600,7 @@ if __name__ == '__main__':
     # for deployment
     # to make it work for both production and development
     port = int(os.environ.get("PORT", 5000))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    # Debug mode exposes the Werkzeug console; opt in explicitly for local work
+    # rather than shipping it on by default.
+    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    app.run(debug=debug, host='0.0.0.0', port=port)
