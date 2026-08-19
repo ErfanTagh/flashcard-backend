@@ -3,6 +3,8 @@ import json
 from flask import Flask, Response, request, jsonify
 from werkzeug.exceptions import HTTPException
 from bson.objectid import ObjectId
+from bson.errors import InvalidId
+import gridfs
 from datetime import datetime
 import random
 from flask_cors import cross_origin
@@ -30,10 +32,16 @@ try:
     client = MongoClient(mongo_uri)
     db = client[mongo_database]
     flashcards_collection = db.flashcards
+    # Card images live in GridFS rather than inside the user document: every
+    # card of every collection sits in that one document, so embedding image
+    # bytes would make /api/cards drag megabytes down the wire on each call,
+    # and would run into the 16MB document ceiling soon after.
+    images = gridfs.GridFS(db)
     print(f"Connected to MongoDB at {mongo_host}:{mongo_port}")
 except Exception as e:
     print(f"Error connecting to MongoDB: {e}")
     flashcards_collection = None
+    images = None
 
 AUTH0_DOMAIN = 'dev-43bumhcy.us.auth0.com'
 API_AUDIENCE = 'recallcards'
@@ -49,6 +57,9 @@ REVIEW_KEY = "FFFLASHBACKCARDS"
 def _default_card(definition):
     return {
         "definition": definition,
+        # GridFS id of a picture shown with the definition, or None. A card may
+        # have text, a picture, or both.
+        "image": None,
         "seen": 0,
         "correct": 0,
         "incorrect": 0,
@@ -257,13 +268,20 @@ def send_word():
     token = data['token']
     word = data['word']
     ans = data['ans']
+    image_id = data.get('image') or None
     collection_name = data.get('collection', 'Default')  # Default collection if not specified
-    
+
+    # A card needs something on the back, but that something may be a picture.
+    if not str(ans).strip() and not image_id:
+        return jsonify({"status": 400, "error": "A definition or an image is required"})
+
     user_doc = flashcards_collection.find_one({'user_email': token})
-    
+
     if not user_doc:
         # Create new user document with collections structure
-        collections = {collection_name: {word: _default_card(ans)}}
+        new_card = _default_card(ans)
+        new_card['image'] = image_id
+        collections = {collection_name: {word: new_card}}
         flashcards_collection.insert_one({
             'user_email': token,
             'collections': collections,
@@ -282,6 +300,12 @@ def send_word():
         existing = collections[collection_name].get(word)
         card = _normalise_card(existing) if existing else _default_card(ans)
         card['definition'] = ans
+        if 'image' in data:
+            # Replacing or clearing a picture orphans the old one in GridFS
+            # unless it is deleted here.
+            if card.get('image') and card['image'] != image_id:
+                _delete_image(card['image'])
+            card['image'] = image_id
         collections[collection_name][word] = card
         flashcards_collection.update_one(
             {'user_email': token},
@@ -324,6 +348,7 @@ def del_word(word):
     
     cards = collections[collection_name]
     if word in cards:
+        _delete_image(_normalise_card(cards[word]).get('image'))
         del cards[word]
         flashcards_collection.update_one(
             {'user_email': token},
@@ -370,6 +395,14 @@ def edit_word():
     incoming = _normalise_card(ans)
     card = _normalise_card(cards[source])
     card['definition'] = incoming['definition']
+
+    # Only touched when the caller says so, so a client that knows nothing
+    # about images cannot wipe one by editing the text.
+    if 'image' in data:
+        new_image = data.get('image') or None
+        if card.get('image') and card['image'] != new_image:
+            _delete_image(card['image'])
+        card['image'] = new_image
 
     # Review state is only changed when the caller actually asks. Editing the
     # text of a card must not silently clear the flag on it.
@@ -526,7 +559,9 @@ def delete_collection(collection_name):
     if collection_name not in collections:
         return {"status": 404, "error": "Collection not found"}
     
-    # Delete the collection
+    # Delete the collection, and the pictures its cards referred to
+    for image_id in _card_image_ids(collections[collection_name]):
+        _delete_image(image_id)
     del collections[collection_name]
     
     # If it was the default collection, set Default as default
@@ -767,6 +802,113 @@ def get_progress():
     }), mimetype='application/json')
 
 
+# Card images
+
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg", "image/png", "image/gif",
+    "image/webp", "image/heic", "image/heif",
+}
+
+# Flask rejects a larger body before the view runs, which turns a huge upload
+# into a cheap 413 instead of buffering it.
+app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES + (256 * 1024)
+
+
+def _delete_image(image_id):
+    """Remove a stored image, ignoring one that has already gone."""
+    if images is None or not image_id:
+        return
+    try:
+        images.delete(ObjectId(image_id))
+    except (InvalidId, TypeError, gridfs.errors.NoFile):
+        pass
+
+
+def _card_image_ids(cards):
+    """Every image referenced by a dict of cards."""
+    for value in cards.values():
+        image_id = _normalise_card(value).get("image")
+        if image_id:
+            yield image_id
+
+
+@app.errorhandler(413)
+def handle_too_large(error):
+    return jsonify({
+        "status": 413,
+        "error": f"Image is too large. The limit is {MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+    }), 413
+
+
+@app.route('/api/images', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def upload_image():
+    """Store a picture and return the id a card refers to it by."""
+    if images is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    upload = request.files.get('file')
+    token = request.form.get('token')
+    if not upload or not token:
+        return jsonify({"status": 400, "error": "A file and a token are required"}), 400
+
+    content_type = (upload.mimetype or "").lower()
+    if content_type not in ALLOWED_IMAGE_TYPES:
+        return jsonify({
+            "status": 400,
+            "error": "Unsupported image type. Use JPEG, PNG, GIF, WEBP or HEIC.",
+        }), 400
+
+    data = upload.read()
+    if not data:
+        return jsonify({"status": 400, "error": "The file is empty"}), 400
+    if len(data) > MAX_IMAGE_BYTES:
+        return jsonify({
+            "status": 413,
+            "error": f"Image is too large. The limit is {MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+        }), 413
+
+    image_id = images.put(
+        data,
+        contentType=content_type,
+        filename=upload.filename or "card-image",
+        metadata={"user_email": token, "uploaded_at": datetime.utcnow().isoformat()},
+    )
+    return Response(json.dumps({"status": 200, "image_id": str(image_id)}),
+                    mimetype='application/json')
+
+
+@app.route('/api/images/<image_id>', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def get_image(image_id):
+    """Serve a stored picture.
+
+    Scoped to the owner, matching how the rest of this API treats an email
+    address as the key to an account's data.
+    """
+    if images is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    email = request.args.get('email')
+    if not email:
+        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+
+    try:
+        stored = images.get(ObjectId(image_id))
+    except (InvalidId, TypeError, gridfs.errors.NoFile):
+        return jsonify({"status": 404, "error": "Image not found"}), 404
+
+    owner = (stored.metadata or {}).get("user_email")
+    if owner and owner != email:
+        return jsonify({"status": 404, "error": "Image not found"}), 404
+
+    response = Response(stored.read(), mimetype=stored.content_type or "application/octet-stream")
+    # The bytes behind an id never change, so this can be cached hard.
+    response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
+    return response
+
+
 # Quiz grading
 #
 # Lives here rather than in each client so that a quiz means the same thing
@@ -924,6 +1066,11 @@ def grade_quiz_answer():
         return jsonify({"status": 404, "error": "Word not found"}), 404
 
     card = _normalise_card(cards[word])
+    if not card['definition'].strip():
+        # Picture-only card: there is no text to compare against, so there is
+        # nothing this endpoint can honestly say about the answer.
+        return jsonify({"status": 400, "error": "This card has no text to grade against"}), 400
+
     grade, similarity = grade_answer(data['answer'], card['definition'])
 
     return Response(json.dumps({
