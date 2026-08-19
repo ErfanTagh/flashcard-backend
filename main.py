@@ -767,6 +767,173 @@ def get_progress():
     }), mimetype='application/json')
 
 
+# Quiz grading
+#
+# Lives here rather than in each client so that a quiz means the same thing
+# everywhere. The outcome of a grading decision is written to a card's review
+# history, so two clients grading differently would make the same accuracy
+# figure mean two different things.
+#
+# Requiring the answer to equal the definition is right for "Danke -> Thanks"
+# and useless for a forty-word definition, where nobody reproduces the wording
+# and being told "wrong" teaches nothing. So answers are scored, and the client
+# is expected to let the reader overrule the result.
+
+CORRECT_THRESHOLD = 0.9
+CLOSE_THRESHOLD = 0.55
+LEADING_ARTICLES = ("a", "an", "the")
+
+
+def _normalise_answer(text):
+    """Lowercase, drop punctuation, collapse whitespace, ignore a leading article."""
+    cleaned = "".join(c if c.isalnum() or c.isspace() else " " for c in text.lower())
+    words = cleaned.split()
+    if words and words[0] in LEADING_ARTICLES:
+        words = words[1:]
+    return " ".join(words)
+
+
+def _typo_allowance(length):
+    """How many character edits still count as the right answer."""
+    if length < 5:
+        return 0    # "need" and "seed" are different words
+    if length < 12:
+        return 1
+    return 2
+
+
+def _edit_distance(a, b):
+    """Optimal string alignment: Levenshtein plus transposition.
+
+    Plain Levenshtein charges two edits for swapping adjacent letters, so
+    "thnaks" would score as far from "thanks" as an unrelated word. Transposing
+    is the commonest typing mistake there is; it costs one.
+    """
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+
+    rows = len(a) + 1
+    cols = len(b) + 1
+    d = [[0] * cols for _ in range(rows)]
+    for i in range(rows):
+        d[i][0] = i
+    for j in range(cols):
+        d[0][j] = j
+
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            d[i][j] = min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + cost)
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                d[i][j] = min(d[i][j], d[i - 2][j - 2] + 1)
+    return d[-1][-1]
+
+
+def _word_overlap(a, b):
+    """F1 over the two word multisets.
+
+    Precision and recall together, so neither padding an answer nor writing
+    half of it scores well.
+    """
+    left = a.split()
+    right = b.split()
+    if not left or not right:
+        return 0.0
+
+    remaining = {}
+    for word in right:
+        remaining[word] = remaining.get(word, 0) + 1
+
+    shared = 0
+    for word in left:
+        if remaining.get(word, 0) > 0:
+            remaining[word] -= 1
+            shared += 1
+    if shared == 0:
+        return 0.0
+
+    precision = shared / len(left)
+    recall = shared / len(right)
+    return 2 * precision * recall / (precision + recall)
+
+
+def _character_similarity(a, b):
+    """1 - (edit distance / longer length), skipped for long text where the
+    comparison is quadratic and word overlap is the better signal anyway."""
+    longest = max(len(a), len(b))
+    if longest == 0 or longest > 120:
+        return 0.0
+    return 1 - _edit_distance(a, b) / longest
+
+
+def grade_answer(answer, definition):
+    """Score a typed answer. Returns (grade, similarity)."""
+    a = _normalise_answer(answer or "")
+    b = _normalise_answer(definition or "")
+
+    if not a or not b:
+        return "incorrect", 0.0
+    if a == b:
+        return "correct", 1.0
+
+    longest = max(len(a), len(b))
+    if longest <= 120:
+        distance = _edit_distance(a, b)
+        if distance <= _typo_allowance(longest):
+            return "correct", 1 - distance / longest
+
+    score = max(_word_overlap(a, b), _character_similarity(a, b))
+    if score >= CORRECT_THRESHOLD:
+        return "correct", score
+    if score >= CLOSE_THRESHOLD:
+        return "close", score
+    return "incorrect", score
+
+
+@app.route('/api/quiz/grade', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def grade_quiz_answer():
+    """Grade a typed answer against a stored card.
+
+    Grading only - the outcome is recorded through /api/review as usual, so a
+    reader who overrules the grade changes the single recorded answer instead
+    of adding a second one.
+    """
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data or 'word' not in data or 'answer' not in data:
+        return jsonify({"status": 400, "error": "Missing required fields"}), 400
+
+    token = data['token']
+    word = data['word']
+    collection_name = data.get('collection', 'Default')
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"}), 404
+
+    collections = migrate_user_to_collections(user_doc)
+    cards = collections.get(collection_name)
+    if cards is None:
+        return jsonify({"status": 404, "error": "Collection not found"}), 404
+    if word not in cards:
+        return jsonify({"status": 404, "error": "Word not found"}), 404
+
+    card = _normalise_card(cards[word])
+    grade, similarity = grade_answer(data['answer'], card['definition'])
+
+    return Response(json.dumps({
+        'status': 200,
+        'grade': grade,
+        'similarity': round(similarity, 4),
+        'expected': card['definition'],
+    }), mimetype='application/json')
+
+
 @app.errorhandler(Exception)
 def handle_unexpected_error(error):
     # Without this, Flask's own 404/405/415 responses were being swallowed and
