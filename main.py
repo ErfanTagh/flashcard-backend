@@ -7,6 +7,7 @@ from bson.errors import InvalidId
 import gridfs
 from datetime import datetime
 import random
+import secrets
 from flask_cors import cross_origin
 from pymongo import MongoClient
 from functools import wraps
@@ -37,11 +38,14 @@ try:
     # bytes would make /api/cards drag megabytes down the wire on each call,
     # and would run into the 16MB document ceiling soon after.
     images = gridfs.GridFS(db)
+    # One document per shared collection; see the sharing section below.
+    shares_collection = db.shares
     print(f"Connected to MongoDB at {mongo_host}:{mongo_port}")
 except Exception as e:
     print(f"Error connecting to MongoDB: {e}")
     flashcards_collection = None
     images = None
+    shares_collection = None
 
 AUTH0_DOMAIN = 'dev-43bumhcy.us.auth0.com'
 API_AUDIENCE = 'recallcards'
@@ -90,6 +94,31 @@ def _normalise_card(value):
 def _legacy_value(card):
     """The definition-plus-sentinel string that older clients expect."""
     return card["definition"] + (REVIEW_KEY if card["needs_review"] else "")
+
+
+# Deck covers
+#
+# `collections` maps a name straight to its cards, and everything in this file
+# relies on that shape, so per-deck settings live in a parallel map rather than
+# being nested inside it. Adding a key here cannot disturb how cards are read.
+
+
+def _display_name_of(user_doc):
+    """The name to show other people, or None if we were never told one."""
+    return ((user_doc or {}).get('display_name') or '').strip() or None
+
+
+def _collection_meta(user_doc):
+    return (user_doc or {}).get('collection_meta') or {}
+
+
+def _cover_of(user_doc, collection_name):
+    return _collection_meta(user_doc).get(collection_name, {}).get('cover_image')
+
+
+def _covers_map(user_doc, collection_names):
+    meta = _collection_meta(user_doc)
+    return {name: meta.get(name, {}).get('cover_image') for name in collection_names}
 
 
 def _card_payload(term, card):
@@ -481,11 +510,17 @@ def get_collections(token):
     user_doc = flashcards_collection.find_one({'user_email': token})
     
     collection_names = list(collections.keys())
+    # An account can exist with no collections now that signing in records a
+    # profile before any cards are added. Every client assumes at least one
+    # deck, so present the same starting point a brand-new user gets.
+    if not collection_names:
+        collection_names = ['Default']
     default_collection = user_doc.get('default_collection', 'Default') if user_doc else 'Default'
     
     return Response(json.dumps({
         'collections': collection_names,
-        'default_collection': default_collection
+        'default_collection': default_collection,
+        'covers': _covers_map(user_doc, collection_names),
     }), mimetype='application/json')
 
 
@@ -559,9 +594,17 @@ def delete_collection(collection_name):
     if collection_name not in collections:
         return {"status": 404, "error": "Collection not found"}
     
-    # Delete the collection, and the pictures its cards referred to
+    # Delete the collection, the pictures its cards referred to, and any share
+    # link pointing at it -- the link would otherwise 404 forever.
     for image_id in _card_image_ids(collections[collection_name]):
         _delete_image(image_id)
+    if shares_collection is not None:
+        shares_collection.delete_many({'owner_email': token, 'collection_name': collection_name})
+
+    meta = dict(_collection_meta(user_doc))
+    _delete_image(meta.get(collection_name, {}).get('cover_image'))
+    meta.pop(collection_name, None)
+
     del collections[collection_name]
     
     # If it was the default collection, set Default as default
@@ -571,9 +614,10 @@ def delete_collection(collection_name):
     
     flashcards_collection.update_one(
         {'user_email': token},
-        {'$set': {'collections': collections, 'default_collection': default_collection, 'updated_at': datetime.utcnow()}}
+        {'$set': {'collections': collections, 'default_collection': default_collection,
+                  'collection_meta': meta, 'updated_at': datetime.utcnow()}}
     )
-    
+
     return {"status": 200}
 
 
@@ -650,12 +694,26 @@ def rename_collection(old_collection_name):
     default_collection = user_doc.get('default_collection', 'Default')
     if default_collection == old_collection_name:
         default_collection = new_collection_name
+
+    # Per-deck settings are keyed by name too, so the cover moves with it.
+    meta = dict(_collection_meta(user_doc))
+    if old_collection_name in meta:
+        meta[new_collection_name] = meta.pop(old_collection_name)
+
+    # A share link points at a collection by name, so it has to follow the
+    # rename or it would resolve to nothing.
+    if shares_collection is not None:
+        shares_collection.update_many(
+            {'owner_email': token, 'collection_name': old_collection_name},
+            {'$set': {'collection_name': new_collection_name}},
+        )
     
     flashcards_collection.update_one(
         {'user_email': token},
-        {'$set': {'collections': collections, 'default_collection': default_collection, 'updated_at': datetime.utcnow()}}
+        {'$set': {'collections': collections, 'default_collection': default_collection,
+                  'collection_meta': meta, 'updated_at': datetime.utcnow()}}
     )
-    
+
     return {"status": 200}
 
 
@@ -825,6 +883,29 @@ def _delete_image(image_id):
         pass
 
 
+def _copy_image_for(image_id, new_owner_email):
+    """Duplicate a stored picture under another account.
+
+    Importing a shared collection copies the bytes rather than pointing at the
+    owner's file, so the recipient keeps their cards intact if the owner later
+    deletes theirs, and image access stays scoped to one account.
+    """
+    if images is None or not image_id:
+        return None
+    try:
+        original = images.get(ObjectId(image_id))
+    except (InvalidId, TypeError, gridfs.errors.NoFile):
+        return None
+
+    copied = images.put(
+        original.read(),
+        contentType=original.content_type,
+        filename=original.filename,
+        metadata={"user_email": new_owner_email, "uploaded_at": datetime.utcnow().isoformat()},
+    )
+    return str(copied)
+
+
 def _card_image_ids(cards):
     """Every image referenced by a dict of cards."""
     for value in cards.values():
@@ -891,8 +972,9 @@ def get_image(image_id):
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
     email = request.args.get('email')
-    if not email:
-        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+    share_id = request.args.get('share')
+    if not email and not share_id:
+        return jsonify({"status": 400, "error": "email or share query parameter is required"}), 400
 
     try:
         stored = images.get(ObjectId(image_id))
@@ -900,13 +982,316 @@ def get_image(image_id):
         return jsonify({"status": 404, "error": "Image not found"}), 404
 
     owner = (stored.metadata or {}).get("user_email")
-    if owner and owner != email:
+
+    # Someone previewing a share is not the owner, so authorise them through
+    # the link instead: the picture must belong to whoever shared it.
+    if share_id:
+        share = (shares_collection.find_one({'share_id': share_id})
+                 if shares_collection is not None else None)
+        if not share or (owner and owner != share['owner_email']):
+            return jsonify({"status": 404, "error": "Image not found"}), 404
+    elif owner and owner != email:
         return jsonify({"status": 404, "error": "Image not found"}), 404
 
     response = Response(stored.read(), mimetype=stored.content_type or "application/octet-stream")
     # The bytes behind an id never change, so this can be cached hard.
     response.headers["Cache-Control"] = "private, max-age=31536000, immutable"
     return response
+
+
+@app.route('/api/profile', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def save_profile():
+    """Record who an email address belongs to.
+
+    The identity provider is the only thing that knows a person's name -- for a
+    Google login Auth0 fills in given_name and family_name itself -- and it only
+    tells the client. So the client hands it here once after signing in, and
+    every feature that needs to show a name reads it from the account instead of
+    being passed one.
+
+    Nothing else changes: the email remains the key, and a caller that skips
+    this simply has no name attached.
+    """
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    token = data['token']
+    name = (data.get('name') or '').strip()[:60]
+
+    update = {'updated_at': datetime.utcnow()}
+    if name:
+        update['display_name'] = name
+
+    # Upsert: someone can sign in before they own any cards.
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': update, '$setOnInsert': {'collections': {}, 'created_at': datetime.utcnow()}},
+        upsert=True,
+    )
+    return jsonify({"status": 200, "display_name": name or None})
+
+
+@app.route('/api/collections/<collection_name>/cover', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def set_collection_cover(collection_name):
+    """Set or clear a deck's cover picture.
+
+    Takes an id from /api/images, so uploading and attaching stay separate the
+    way they do for cards.
+    """
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    token = data['token']
+    image_id = data.get('image') or None
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"}), 404
+
+    collections = migrate_user_to_collections(user_doc)
+    if collection_name not in collections:
+        return jsonify({"status": 404, "error": "Collection not found"}), 404
+
+    meta = dict(_collection_meta(user_doc))
+    previous = meta.get(collection_name, {}).get('cover_image')
+    if previous and previous != image_id:
+        _delete_image(previous)
+
+    entry = dict(meta.get(collection_name, {}))
+    if image_id:
+        entry['cover_image'] = image_id
+    else:
+        entry.pop('cover_image', None)
+    meta[collection_name] = entry
+
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'collection_meta': meta, 'updated_at': datetime.utcnow()}},
+    )
+    return jsonify({"status": 200, "cover": image_id})
+
+
+# Sharing collections
+#
+# A share is a random, unguessable id that stands for "this user's collection
+# called X". Anyone holding the link can look at it and copy it; there is no
+# per-recipient permission, which is the model people expect from a share link
+# and the only one that works without accounts for the recipients.
+#
+# The link reads through to the owner's live collection rather than freezing a
+# snapshot, so edits reach anyone who opens it later. Importing takes a copy at
+# that moment: the recipient gets their own cards, their own pictures and a
+# clean review history, and nothing the owner does afterwards can reach into
+# their account.
+
+
+def _share_url_path(share_id):
+    return f"/import/{share_id}"
+
+
+def _share_payload(share):
+    return {
+        "share_id": share["share_id"],
+        "collection": share["collection_name"],
+        "path": _share_url_path(share["share_id"]),
+    }
+
+
+@app.route('/api/collections/<collection_name>/share', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def share_collection(collection_name):
+    """Create a share link for a collection, or return the one it already has."""
+    if flashcards_collection is None or shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    token = data['token']
+    # Accepted for clients that send it inline, but the account's own name wins:
+    # see /api/profile.
+    display_name = (data.get('display_name') or '').strip()[:60] or None
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"}), 404
+
+    collections = migrate_user_to_collections(user_doc)
+    if collection_name not in collections:
+        return jsonify({"status": 404, "error": "Collection not found"}), 404
+
+    # Idempotent: sharing twice hands back the same link rather than making a
+    # second one that also works forever.
+    existing = shares_collection.find_one({
+        'owner_email': token, 'collection_name': collection_name,
+    })
+    if existing:
+        if display_name and existing.get('owner_name') != display_name:
+            shares_collection.update_one({'_id': existing['_id']},
+                                         {'$set': {'owner_name': display_name}})
+        return Response(json.dumps({"status": 200, **_share_payload(existing)}),
+                        mimetype='application/json')
+
+    share = {
+        'share_id': secrets.token_urlsafe(9),
+        'owner_email': token,
+        'owner_name': display_name,
+        'collection_name': collection_name,
+        'created_at': datetime.utcnow(),
+    }
+    shares_collection.insert_one(share)
+    return Response(json.dumps({"status": 200, **_share_payload(share)}),
+                    mimetype='application/json')
+
+
+@app.route('/api/collections/<collection_name>/share', methods=['DELETE'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def unshare_collection(collection_name):
+    """Revoke a share link. Copies already taken are unaffected."""
+    if shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    result = shares_collection.delete_one({
+        'owner_email': data['token'], 'collection_name': collection_name,
+    })
+    if result.deleted_count == 0:
+        return jsonify({"status": 404, "error": "That collection is not shared"}), 404
+    return jsonify({"status": 200})
+
+
+@app.route('/api/shares/<share_id>', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def get_share(share_id):
+    """What is behind a share link. Deliberately open: holding the link is the
+    permission, and a recipient has to see what they are importing first."""
+    if flashcards_collection is None or shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    share = shares_collection.find_one({'share_id': share_id})
+    if not share:
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+
+    owner_doc = flashcards_collection.find_one({'user_email': share['owner_email']})
+    if not owner_doc:
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+
+    collections = migrate_user_to_collections(owner_doc)
+    cards = collections.get(share['collection_name'])
+    if cards is None:
+        # The owner renamed or deleted it after sharing.
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+
+    # Review history is the owner's, not part of what is being shared.
+    payload = []
+    for term, value in cards.items():
+        card = _normalise_card(value)
+        payload.append({
+            'term': term,
+            'definition': card['definition'],
+            'image': card['image'],
+        })
+
+    return Response(json.dumps({
+        'status': 200,
+        'share_id': share_id,
+        'collection': share['collection_name'],
+        # Read from the account so a changed name shows up on links already
+        # out in the world; the copy on the share is only a fallback for links
+        # made before profiles were recorded.
+        'owner_name': _display_name_of(owner_doc) or share.get('owner_name'),
+        'cover': _cover_of(owner_doc, share['collection_name']),
+        'card_count': len(payload),
+        'cards': payload,
+    }), mimetype='application/json')
+
+
+@app.route('/api/shares/<share_id>/import', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def import_share(share_id):
+    """Copy a shared collection into the caller's account."""
+    if flashcards_collection is None or shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    token = data['token']
+    share = shares_collection.find_one({'share_id': share_id})
+    if not share:
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+
+    owner_doc = flashcards_collection.find_one({'user_email': share['owner_email']})
+    source = migrate_user_to_collections(owner_doc).get(share['collection_name']) if owner_doc else None
+    if source is None:
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+    if not source:
+        return jsonify({"status": 400, "error": "That collection is empty"}), 400
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    collections = migrate_user_to_collections(user_doc) if user_doc else {}
+
+    # Never overwrite what the recipient already has.
+    requested = (data.get('collection_name') or share['collection_name']).strip()
+    name = requested or share['collection_name']
+    if name in collections:
+        suffix = 2
+        while f"{name} ({suffix})" in collections:
+            suffix += 1
+        name = f"{name} ({suffix})"
+
+    imported = {}
+    for term, value in source.items():
+        card = _normalise_card(value)
+        # Fresh cards: the recipient has not studied any of this yet.
+        copy = _default_card(card['definition'])
+        copy['image'] = _copy_image_for(card['image'], token)
+        imported[term] = copy
+
+    collections[name] = imported
+
+    # The cover is copied like any other picture, so the recipient's deck keeps
+    # looking right even if the owner later deletes theirs.
+    meta = dict(_collection_meta(user_doc))
+    copied_cover = _copy_image_for(_cover_of(owner_doc, share['collection_name']), token)
+    if copied_cover:
+        meta[name] = {**meta.get(name, {}), 'cover_image': copied_cover}
+
+    if user_doc:
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'collections': collections, 'collection_meta': meta,
+                      'updated_at': datetime.utcnow()}},
+        )
+    else:
+        flashcards_collection.insert_one({
+            'user_email': token,
+            'collections': collections,
+            'collection_meta': meta,
+            'default_collection': name,
+            'created_at': datetime.utcnow(),
+        })
+
+    return Response(json.dumps({
+        'status': 200,
+        'collection': name,
+        'imported': len(imported),
+    }), mimetype='application/json')
 
 
 # Quiz grading
