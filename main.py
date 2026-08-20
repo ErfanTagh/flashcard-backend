@@ -1426,11 +1426,44 @@ def _open_shared_deck(share_id, token):
     return share, collections, cards, None
 
 
-def _save_shared_deck(share, collections):
-    flashcards_collection.update_one(
-        {'user_email': share['owner_email']},
-        {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}},
-    )
+def _card_field_path(collection_name, term):
+    """Dotted path to a single card, or None if the names cannot express one.
+
+    MongoDB reads a dot in an update key as a path separator, so a collection
+    or term containing one -- or starting with $ -- cannot be addressed this
+    way and has to fall back to rewriting the map.
+    """
+    for name in (collection_name, term):
+        if '.' in name or name.startswith('$'):
+            return None
+    return f'collections.{collection_name}.{term}'
+
+
+def _write_shared_card(share, collections, term, card, replaced_term=None):
+    """Persist one card of a shared deck, touching only that card when possible.
+
+    A shared deck has several people writing to it. Rewriting the whole
+    collections map on every edit means two people saving at the same moment
+    produce a last-writer-wins result: one person's card silently disappears.
+    Addressing the single field lets the database merge both.
+    """
+    collection_name = share['collection_name']
+    path = _card_field_path(collection_name, term)
+    old_path = (_card_field_path(collection_name, replaced_term)
+                if replaced_term and replaced_term != term else None)
+
+    if path is None or (replaced_term and replaced_term != term and old_path is None):
+        # Unaddressable name: fall back to the whole-map write.
+        flashcards_collection.update_one(
+            {'user_email': share['owner_email']},
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}},
+        )
+        return
+
+    update = {'$set': {path: card, 'updated_at': datetime.utcnow()}}
+    if old_path:
+        update['$unset'] = {old_path: ""}
+    flashcards_collection.update_one({'user_email': share['owner_email']}, update)
 
 
 @app.route('/api/shares/<share_id>/cards', methods=['POST'])
@@ -1469,7 +1502,7 @@ def add_card_to_shared_deck(share_id):
         card['image'] = image_id
     cards[term] = card
 
-    _save_shared_deck(share, collections)
+    _write_shared_card(share, collections, term, card)
     return jsonify({"status": 200, "collection": share['collection_name']})
 
 
@@ -1505,7 +1538,7 @@ def edit_card_in_shared_deck(share_id):
         del cards[old_term]
     cards[term] = card
 
-    _save_shared_deck(share, collections)
+    _write_shared_card(share, collections, term, card, replaced_term=old_term)
     return jsonify({"status": 200, "collection": share['collection_name']})
 
 
