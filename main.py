@@ -551,7 +551,14 @@ def get_collections(token):
     user_doc = flashcards_collection.find_one({'user_email': token})
     if not user_doc:
         # Return empty structure for new users
-        return Response(json.dumps({'collections': ['Default'], 'default_collection': 'Default'}), mimetype='application/json')
+        # Same shape as the populated response, so a client never has to
+        # special-case a brand-new account.
+        return Response(json.dumps({
+            'collections': ['Default'],
+            'default_collection': 'Default',
+            'covers': {'Default': None},
+            'linked': [],
+        }), mimetype='application/json')
     
     # Migrate if needed
     collections = migrate_user_to_collections(user_doc)
