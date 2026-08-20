@@ -1356,10 +1356,15 @@ def get_share(share_id):
             'image': card['image'],
         })
 
+    # A viewer that says who it is gets told whether the deck is already theirs,
+    # so the page can offer something other than a button that cannot work.
+    viewer = request.args.get('email')
+
     return Response(json.dumps({
         'status': 200,
         'share_id': share_id,
         'collection': share['collection_name'],
+        'is_owner': bool(viewer) and viewer == share['owner_email'],
         # Read from the account so a changed name shows up on links already
         # out in the world; the copy on the share is only a fallback for links
         # made before profiles were recorded.
@@ -1392,6 +1397,15 @@ def import_share(share_id):
         return jsonify({"status": 404, "error": "This link is no longer available"}), 404
     if not source:
         return jsonify({"status": 400, "error": "That collection is empty"}), 400
+
+    # Importing your own link would copy a deck alongside itself, which is
+    # never what opening it means -- people open their own share links to check
+    # they work. Refused here rather than in a client, so no client can do it.
+    if share['owner_email'] == token:
+        return jsonify({
+            "status": 400,
+            "error": "This is your own deck. It is already in your collections.",
+        }), 400
 
     user_doc = flashcards_collection.find_one({'user_email': token})
     collections = migrate_user_to_collections(user_doc) if user_doc else {}
