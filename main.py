@@ -804,14 +804,43 @@ def get_collection_stats(token):
     # Migrate if needed
     collections = migrate_user_to_collections(user_doc)
     
+    def summarise(cards):
+        """What the deck list needs to answer 'how ready am I?' at a glance."""
+        values = list(cards.values())
+        stamps = [c['last_reviewed'] for c in values if c.get('last_reviewed')]
+        return {
+            'total': len(values),
+            'known': sum(1 for c in values if c['seen'] > 0 and not c['needs_review']),
+            'needs_review': sum(1 for c in values if c['needs_review']),
+            'studied': sum(1 for c in values if c['seen'] > 0),
+            'last_reviewed': max(stamps) if stamps else None,
+        }
+
     stats = {}
+    # Per-deck progress in the same response as the counts. The deck list needs
+    # it for every deck at once, and one request beats one per deck.
+    progress = {}
+    owners = {}
+
     for collection_name, cards in collections.items():
         stats[collection_name] = len(cards)
-    for name in _linked_collections(user_doc):
+        progress[collection_name] = summarise({t: _normalise_card(v) for t, v in cards.items()})
+
+    for name, link in _linked_collections(user_doc).items():
         followed, _ = _resolve_collection(user_doc, name)
         stats[name] = len(followed)
+        progress[name] = summarise(followed)
+        share = (shares_collection.find_one({'share_id': link.get('share_id')})
+                 if shares_collection is not None else None)
+        if share:
+            owner_doc = flashcards_collection.find_one({'user_email': share['owner_email']})
+            owners[name] = _display_name_of(owner_doc) or share.get('owner_name')
     
-    return Response(json.dumps({'stats': stats}), mimetype='application/json')
+    return Response(json.dumps({
+        'stats': stats,
+        'progress': progress,
+        'owners': owners,
+    }), mimetype='application/json')
 
 
 @app.route('/api/cards', methods=['GET'])
