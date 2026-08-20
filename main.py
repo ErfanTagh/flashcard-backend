@@ -306,6 +306,27 @@ def send_word():
 
     user_doc = flashcards_collection.find_one({'user_email': token})
 
+    # A deck the caller follows is written through its share, so the card lands
+    # in the one deck everyone with the link is reading.
+    share, error = _followed_write_target(user_doc, token, collection_name)
+    if error:
+        return error
+    if share:
+        _, source = _shared_source(share)
+        if source is None:
+            return jsonify({"status": 404, "error": "That shared deck is no longer available"}), 404
+        if word not in source and len(source) >= MAX_SHARED_DECK_CARDS:
+            return jsonify({"status": 400,
+                            "error": f"This deck has reached {MAX_SHARED_DECK_CARDS} cards."})
+        existing = source.get(word)
+        card = _normalise_card(existing) if existing else _default_card(ans)
+        card['definition'] = ans
+        if image_id:
+            card['image'] = image_id
+        source[word] = card
+        _write_shared_card(share, {share['collection_name']: source}, word, card)
+        return {"status": 200}
+
     if not user_doc:
         # Create new user document with collections structure
         new_card = _default_card(ans)
@@ -367,10 +388,17 @@ def del_word(word):
     user_doc = flashcards_collection.find_one({'user_email': token})
     if not user_doc:
         return jsonify({"status": 404, "error": "User not found"})
-    
+
+    # Deleting from a followed deck is the owner's alone; see the sharing note.
+    if collection_name in _linked_collections(user_doc):
+        return jsonify({
+            "status": 403,
+            "error": "Only the owner can delete cards from a shared deck.",
+        }), 403
+
     # Migrate if needed
     collections = migrate_user_to_collections(user_doc)
-    
+
     # Initialize collection if it doesn't exist
     if collection_name not in collections:
         return jsonify({"status": 404, "error": "Collection not found"})
@@ -407,14 +435,36 @@ def edit_word():
     user_doc = flashcards_collection.find_one({'user_email': token})
     if not user_doc:
         return jsonify({"status": 404, "error": "User not found"})
-    
+
+    # Same for edits: a followed deck is edited through its share.
+    share, error = _followed_write_target(user_doc, token, collection_name)
+    if error:
+        return error
+    if share:
+        _, shared = _shared_source(share)
+        if shared is None:
+            return jsonify({"status": 404, "error": "That shared deck is no longer available"}), 404
+        origin = word if word in shared else oldWord
+        if origin not in shared:
+            return jsonify({"status": 404, "error": "Word not found"})
+        card = _normalise_card(shared[origin])
+        card['definition'] = _normalise_card(ans)['definition']
+        if 'image' in data:
+            card['image'] = data.get('image') or None
+        if word != origin:
+            del shared[origin]
+        shared[word] = card
+        _write_shared_card(share, {share['collection_name']: shared}, word,
+                           card, replaced_term=origin)
+        return jsonify({"status": 200})
+
     # Migrate if needed
     collections = migrate_user_to_collections(user_doc)
-    
+
     # Initialize collection if it doesn't exist
     if collection_name not in collections:
         collections[collection_name] = {}
-    
+
     cards = collections[collection_name]
 
     source = word if word in cards else oldWord
@@ -510,6 +560,10 @@ def get_collections(token):
     user_doc = flashcards_collection.find_one({'user_email': token})
     
     collection_names = list(collections.keys())
+    # Decks followed through a share link sit alongside owned ones, so every
+    # client lists them without knowing they are shared.
+    linked = _linked_collections(user_doc)
+    collection_names += [name for name in linked if name not in collection_names]
     # An account can exist with no collections now that signing in records a
     # profile before any cards are added. Every client assumes at least one
     # deck, so present the same starting point a brand-new user gets.
@@ -521,6 +575,7 @@ def get_collections(token):
         'collections': collection_names,
         'default_collection': default_collection,
         'covers': _covers_map(user_doc, collection_names),
+        'linked': list(linked.keys()),
     }), mimetype='application/json')
 
 
@@ -587,10 +642,21 @@ def delete_collection(collection_name):
     user_doc = flashcards_collection.find_one({'user_email': token})
     if not user_doc:
         return {"status": 404, "error": "User not found"}
-    
+
+    # "Delete" on a followed deck means stop following: it is not the caller's
+    # deck to delete, and the owner's copy must survive.
+    links = dict(_linked_collections(user_doc))
+    if collection_name in links:
+        del links[collection_name]
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'linked_collections': links, 'updated_at': datetime.utcnow()}},
+        )
+        return {"status": 200}
+
     # Migrate if needed
     collections = migrate_user_to_collections(user_doc)
-    
+
     if collection_name not in collections:
         return {"status": 404, "error": "Collection not found"}
     
@@ -734,6 +800,9 @@ def get_collection_stats(token):
     stats = {}
     for collection_name, cards in collections.items():
         stats[collection_name] = len(cards)
+    for name in _linked_collections(user_doc):
+        followed, _ = _resolve_collection(user_doc, name)
+        stats[name] = len(followed)
     
     return Response(json.dumps({'stats': stats}), mimetype='application/json')
 
@@ -755,8 +824,7 @@ def get_cards():
     if not user_doc:
         return Response(json.dumps({'cards': []}), mimetype='application/json')
 
-    collections = migrate_user_to_collections(user_doc)
-    cards = collections.get(collection_name, {})
+    cards, _ = _resolve_collection(user_doc, collection_name)
 
     payload = [_card_payload(term, card) for term, card in cards.items()]
     return Response(json.dumps({'cards': payload}), mimetype='application/json')
@@ -787,8 +855,40 @@ def record_review():
 
     collections = migrate_user_to_collections(user_doc)
     cards = collections.get(collection_name)
+
+    # A followed deck's cards belong to someone else; only the progress is
+    # this account's, so a review updates that and leaves the deck alone.
     if cards is None:
-        return jsonify({"status": 404, "error": "Collection not found"})
+        resolved, link = _resolve_collection(user_doc, collection_name)
+        if link is None:
+            return jsonify({"status": 404, "error": "Collection not found"})
+        if word not in resolved:
+            return jsonify({"status": 404, "error": "Word not found"})
+
+        card = _normalise_card(resolved[word])
+        card['seen'] += 1
+        card['last_reviewed'] = datetime.utcnow().isoformat()
+        if outcome == 'correct':
+            card['correct'] += 1
+            card['needs_review'] = False
+        else:
+            card['incorrect'] += 1
+            card['needs_review'] = True
+
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {
+                f'linked_collections.{collection_name}.progress.{word}': {
+                    'seen': card['seen'], 'correct': card['correct'],
+                    'incorrect': card['incorrect'], 'needs_review': card['needs_review'],
+                    'last_reviewed': card['last_reviewed'],
+                },
+                'updated_at': datetime.utcnow(),
+            }},
+        )
+        return Response(json.dumps({'status': 200, 'card': _card_payload(word, card)}),
+                        mimetype='application/json')
+
     if word not in cards:
         return jsonify({"status": 404, "error": "Word not found"})
 
@@ -834,8 +934,8 @@ def get_progress():
     if not user_doc:
         return Response(json.dumps(empty), mimetype='application/json')
 
-    collections = migrate_user_to_collections(user_doc)
-    cards = list(collections.get(collection_name, {}).values())
+    resolved, _ = _resolve_collection(user_doc, collection_name)
+    cards = list(resolved.values())
     if not cards:
         return Response(json.dumps(empty), mimetype='application/json')
 
@@ -1229,6 +1329,184 @@ def set_collection_cover(collection_name):
         {'$set': {'collection_meta': meta, 'updated_at': datetime.utcnow()}},
     )
     return jsonify({"status": 200, "cover": image_id})
+
+
+# Followed decks
+#
+# A deck can be taken two ways. Importing copies it: the reader owns the cards
+# and nothing the owner does afterwards reaches them. Following links to it:
+# the cards are read from the owner's deck every time, so an edit by anyone
+# with the link is seen by everyone with the link.
+#
+# What cannot be shared is progress. `seen`, `correct` and `needs_review` live
+# on the card, and one shared copy of those would mean a study group
+# overwriting each other's history. So a follower stores their own progress,
+# keyed by term, on their own account, and it is merged onto the shared cards
+# on the way out. Content is one thing; how far along you are is yours.
+
+
+def _linked_collections(user_doc):
+    return (user_doc or {}).get('linked_collections') or {}
+
+
+def _shared_source(share):
+    """The cards behind a share, or None if it no longer resolves."""
+    if flashcards_collection is None or not share:
+        return None, None
+    owner_doc = flashcards_collection.find_one({'user_email': share['owner_email']})
+    if not owner_doc:
+        return None, None
+    cards = migrate_user_to_collections(owner_doc).get(share['collection_name'])
+    if cards is None:
+        return None, None
+    return owner_doc, cards
+
+
+def _resolve_collection(user_doc, collection_name):
+    """Cards for a collection, whether the caller owns it or follows it.
+
+    Returns (cards, link) where `link` is the follow record for a followed
+    deck and None for an owned one. Callers that write have to check which.
+    """
+    if user_doc is None:
+        return {}, None
+
+    owned = migrate_user_to_collections(user_doc)
+    if collection_name in owned:
+        return owned[collection_name], None
+
+    link = _linked_collections(user_doc).get(collection_name)
+    if not link or shares_collection is None:
+        return {}, None
+
+    share = shares_collection.find_one({'share_id': link.get('share_id')})
+    _, source = _shared_source(share)
+    if source is None:
+        return {}, link
+
+    # The follower's own history, laid over shared content.
+    progress = link.get('progress') or {}
+    merged = {}
+    for term, value in source.items():
+        card = _normalise_card(value)
+        mine = progress.get(term) or {}
+        card['seen'] = mine.get('seen', 0)
+        card['correct'] = mine.get('correct', 0)
+        card['incorrect'] = mine.get('incorrect', 0)
+        card['needs_review'] = mine.get('needs_review', False)
+        card['last_reviewed'] = mine.get('last_reviewed')
+        merged[term] = card
+    return merged, link
+
+
+def _followed_write_target(user_doc, token, collection_name):
+    """For a followed deck, the share to write through -- or an error.
+
+    Without this, a follower adding a card through the ordinary endpoint would
+    create a second, owned deck of the same name sitting beside the one they
+    follow. Returns (share, error_response); both None means the deck is the
+    caller's own and the ordinary path applies.
+    """
+    if user_doc is None:
+        return None, None
+    if collection_name in migrate_user_to_collections(user_doc):
+        return None, None
+
+    link = _linked_collections(user_doc).get(collection_name)
+    if not link:
+        return None, None
+    if shares_collection is None:
+        return None, (jsonify({"status": 500, "error": "Database not connected"}), 500)
+
+    share = shares_collection.find_one({'share_id': link.get('share_id')})
+    if not share:
+        return None, (jsonify({"status": 404, "error": "That shared deck is no longer available"}), 404)
+    if not share.get('allow_edit'):
+        return None, (jsonify({
+            "status": 403,
+            "error": "This deck is shared read-only. Ask the owner to allow editing.",
+        }), 403)
+    return share, None
+
+
+@app.route('/api/shares/<share_id>/follow', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def follow_share(share_id):
+    """Add a shared deck to an account without copying it."""
+    if flashcards_collection is None or shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    if not token:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    share = shares_collection.find_one({'share_id': share_id})
+    if not share:
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+    if share['owner_email'] == token:
+        return jsonify({
+            "status": 400,
+            "error": "This is your own deck. It is already in your collections.",
+        }), 400
+
+    _, source = _shared_source(share)
+    if source is None:
+        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    owned = migrate_user_to_collections(user_doc) if user_doc else {}
+    links = dict(_linked_collections(user_doc))
+
+    # Already following it: nothing to do, and say so rather than making a
+    # second entry pointing at the same deck.
+    for name, link in links.items():
+        if link.get('share_id') == share_id:
+            return jsonify({"status": 200, "collection": name, "already": True})
+
+    name = _unique_collection_name({**owned, **links}, share['collection_name'])
+    links[name] = {'share_id': share_id, 'progress': {}, 'followed_at': datetime.utcnow().isoformat()}
+
+    if user_doc:
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'linked_collections': links, 'updated_at': datetime.utcnow()}},
+        )
+    else:
+        flashcards_collection.insert_one({
+            'user_email': token,
+            'collections': {},
+            'linked_collections': links,
+            'default_collection': name,
+            'created_at': datetime.utcnow(),
+        })
+
+    return jsonify({"status": 200, "collection": name, "cards": len(source)})
+
+
+@app.route('/api/collections/<collection_name>/unfollow', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def unfollow_collection(collection_name):
+    """Stop following a shared deck. The owner's deck is untouched."""
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    if not token:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    links = dict(_linked_collections(user_doc))
+    if collection_name not in links:
+        return jsonify({"status": 404, "error": "You are not following that deck"}), 404
+
+    del links[collection_name]
+    flashcards_collection.update_one(
+        {'user_email': token},
+        {'$set': {'linked_collections': links, 'updated_at': datetime.utcnow()}},
+    )
+    return jsonify({"status": 200})
 
 
 # Sharing collections
