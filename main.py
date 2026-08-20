@@ -999,6 +999,156 @@ def get_image(image_id):
     return response
 
 
+# Importing a deck from JSON
+#
+# Written to be forgiving about shape, because the point is to paste in what a
+# language model produced and have it work. Models reliably get the idea and
+# unreliably get the spelling: "front"/"back" instead of "term"/"definition", a
+# bare list with no wrapper, a stray blank entry. All of that is accepted. What
+# is not accepted is anything that would produce a broken card, and the caller
+# is told exactly which entry failed and why.
+
+MAX_IMPORT_CARDS = 500
+MAX_TERM_LENGTH = 200
+MAX_DEFINITION_LENGTH = 2000
+
+# Aliases seen in practice from models asked for flashcards.
+TERM_KEYS = ("term", "front", "question", "word", "prompt")
+DEFINITION_KEYS = ("definition", "back", "answer", "meaning", "response")
+
+
+def _unique_collection_name(collections, requested):
+    """A name that does not collide with one the user already has."""
+    name = (requested or "").strip() or "Imported"
+    if name not in collections:
+        return name
+    suffix = 2
+    while f"{name} ({suffix})" in collections:
+        suffix += 1
+    return f"{name} ({suffix})"
+
+
+def _first_key(entry, keys):
+    for key in keys:
+        if key in entry and entry[key] is not None:
+            return entry[key]
+    return None
+
+
+def parse_deck_json(payload):
+    """Turn a parsed JSON document into (name, cards, warnings).
+
+    Raises ValueError with a message meant to be shown to the person who
+    pasted it.
+    """
+    name = ""
+    if isinstance(payload, dict):
+        raw_cards = payload.get("cards")
+        if raw_cards is None:
+            raw_cards = _first_key(payload, ("flashcards", "items", "deck"))
+        name = str(payload.get("name") or payload.get("deck_name") or "").strip()
+    elif isinstance(payload, list):
+        # A bare list of cards is a common shape; the name comes from the form.
+        raw_cards = payload
+    else:
+        raise ValueError("The JSON should be an object with a \"cards\" list, or a list of cards.")
+
+    if not isinstance(raw_cards, list):
+        raise ValueError("\"cards\" should be a list.")
+    if not raw_cards:
+        raise ValueError("There are no cards in that JSON.")
+    if len(raw_cards) > MAX_IMPORT_CARDS:
+        raise ValueError(f"That is {len(raw_cards)} cards; the limit is {MAX_IMPORT_CARDS}.")
+
+    cards = {}
+    warnings = []
+    for index, entry in enumerate(raw_cards, start=1):
+        if not isinstance(entry, dict):
+            raise ValueError(f"Card {index} is not an object with a term and a definition.")
+
+        term = _first_key(entry, TERM_KEYS)
+        definition = _first_key(entry, DEFINITION_KEYS)
+
+        if term is None:
+            raise ValueError(f"Card {index} has no \"term\".")
+        if definition is None:
+            raise ValueError(f"Card {index} has no \"definition\".")
+        if isinstance(term, (dict, list)) or isinstance(definition, (dict, list)):
+            raise ValueError(f"Card {index} should use plain text, not nested objects.")
+
+        term = str(term).strip()
+        definition = str(definition).strip()
+
+        if not term:
+            raise ValueError(f"Card {index} has an empty term.")
+        if not definition:
+            raise ValueError(f"Card {index} (\"{term[:40]}\") has an empty definition.")
+        if len(term) > MAX_TERM_LENGTH:
+            raise ValueError(f"Card {index} has a term longer than {MAX_TERM_LENGTH} characters.")
+        if len(definition) > MAX_DEFINITION_LENGTH:
+            raise ValueError(
+                f"Card {index} (\"{term[:40]}\") has a definition longer than "
+                f"{MAX_DEFINITION_LENGTH} characters."
+            )
+
+        # Cards are keyed by term, so a repeat would silently replace the first.
+        if term in cards:
+            warnings.append(f"\"{term}\" appears more than once; the last one was kept.")
+        cards[term] = definition
+
+    return name, cards, warnings
+
+
+@app.route('/api/collections/import', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def import_deck_json():
+    """Create a deck from a JSON document."""
+    if flashcards_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True)
+    if not data or 'token' not in data:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+
+    token = data['token']
+    payload = data.get('deck')
+    if payload is None:
+        return jsonify({"status": 400, "error": "Missing deck in request body"}), 400
+
+    try:
+        parsed_name, cards, warnings = parse_deck_json(payload)
+    except ValueError as error:
+        return jsonify({"status": 400, "error": str(error)}), 400
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    collections = migrate_user_to_collections(user_doc) if user_doc else {}
+
+    requested = (data.get('name') or parsed_name or "Imported").strip()
+    name = _unique_collection_name(collections, requested)
+
+    collections[name] = {term: _default_card(definition) for term, definition in cards.items()}
+
+    if user_doc:
+        flashcards_collection.update_one(
+            {'user_email': token},
+            {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}},
+        )
+    else:
+        flashcards_collection.insert_one({
+            'user_email': token,
+            'collections': collections,
+            'default_collection': name,
+            'created_at': datetime.utcnow(),
+        })
+
+    return Response(json.dumps({
+        'status': 200,
+        'collection': name,
+        'imported': len(cards),
+        'warnings': warnings,
+    }), mimetype='application/json')
+
+
 @app.route('/api/profile', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
 def save_profile():
@@ -1248,12 +1398,7 @@ def import_share(share_id):
 
     # Never overwrite what the recipient already has.
     requested = (data.get('collection_name') or share['collection_name']).strip()
-    name = requested or share['collection_name']
-    if name in collections:
-        suffix = 2
-        while f"{name} ({suffix})" in collections:
-            suffix += 1
-        name = f"{name} ({suffix})"
+    name = _unique_collection_name(collections, requested or share['collection_name'])
 
     imported = {}
     for term, value in source.items():
