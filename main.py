@@ -1253,6 +1253,7 @@ def _share_payload(share):
     return {
         "share_id": share["share_id"],
         "collection": share["collection_name"],
+        "allow_edit": bool(share.get("allow_edit")),
         "path": _share_url_path(share["share_id"]),
     }
 
@@ -1287,9 +1288,16 @@ def share_collection(collection_name):
         'owner_email': token, 'collection_name': collection_name,
     })
     if existing:
+        changes = {}
         if display_name and existing.get('owner_name') != display_name:
-            shares_collection.update_one({'_id': existing['_id']},
-                                         {'$set': {'owner_name': display_name}})
+            changes['owner_name'] = display_name
+        # Only the owner reaches this endpoint, so this is the one place
+        # collaboration can be switched on or off.
+        if 'allow_edit' in data:
+            changes['allow_edit'] = bool(data['allow_edit'])
+        if changes:
+            shares_collection.update_one({'_id': existing['_id']}, {'$set': changes})
+            existing.update(changes)
         return Response(json.dumps({"status": 200, **_share_payload(existing)}),
                         mimetype='application/json')
 
@@ -1298,6 +1306,10 @@ def share_collection(collection_name):
         'owner_email': token,
         'owner_name': display_name,
         'collection_name': collection_name,
+        # Off unless asked for: a link that only hands out copies cannot damage
+        # the original, and that is the safe default for a link that will be
+        # forwarded further than intended.
+        'allow_edit': bool(data.get('allow_edit')),
         'created_at': datetime.utcnow(),
     }
     shares_collection.insert_one(share)
@@ -1365,6 +1377,7 @@ def get_share(share_id):
         'share_id': share_id,
         'collection': share['collection_name'],
         'is_owner': bool(viewer) and viewer == share['owner_email'],
+        'allow_edit': bool(share.get('allow_edit')),
         # Read from the account so a changed name shows up on links already
         # out in the world; the copy on the share is only a fallback for links
         # made before profiles were recorded.
@@ -1373,6 +1386,127 @@ def get_share(share_id):
         'card_count': len(payload),
         'cards': payload,
     }), mimetype='application/json')
+
+
+MAX_SHARED_DECK_CARDS = 1000
+
+
+def _open_shared_deck(share_id, token):
+    """Resolve a share that grants editing, for a caller who supplies a token.
+
+    Returns (owner_doc, collections, cards, error_response). Only one of the
+    first three and the last is meaningful.
+    """
+    if flashcards_collection is None or shares_collection is None:
+        return None, None, None, (jsonify({"status": 500, "error": "Database not connected"}), 500)
+    if not token:
+        return None, None, None, (jsonify({"status": 400, "error": "Missing token in request body"}), 400)
+
+    share = shares_collection.find_one({'share_id': share_id})
+    if not share:
+        return None, None, None, (jsonify({"status": 404, "error": "This link is no longer available"}), 404)
+
+    # Editing through a link is off unless the owner turned it on. The owner
+    # themselves always reaches their own deck through the normal endpoints.
+    if not share.get('allow_edit') and share['owner_email'] != token:
+        return None, None, None, (jsonify({
+            "status": 403,
+            "error": "This deck is shared read-only. Ask the owner to allow editing.",
+        }), 403)
+
+    owner_doc = flashcards_collection.find_one({'user_email': share['owner_email']})
+    if not owner_doc:
+        return None, None, None, (jsonify({"status": 404, "error": "This link is no longer available"}), 404)
+
+    collections = migrate_user_to_collections(owner_doc)
+    cards = collections.get(share['collection_name'])
+    if cards is None:
+        return None, None, None, (jsonify({"status": 404, "error": "This link is no longer available"}), 404)
+
+    return share, collections, cards, None
+
+
+def _save_shared_deck(share, collections):
+    flashcards_collection.update_one(
+        {'user_email': share['owner_email']},
+        {'$set': {'collections': collections, 'updated_at': datetime.utcnow()}},
+    )
+
+
+@app.route('/api/shares/<share_id>/cards', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def add_card_to_shared_deck(share_id):
+    """Add a card to a deck shared for editing.
+
+    Writes into the owner's deck, so everyone holding the link sees it. There
+    is deliberately no delete counterpart: a link travels further than the
+    group it was meant for, and losing a deck days before an exam is not
+    something an undo-less app should make possible. Removing a card stays with
+    the owner.
+    """
+    data = request.get_json(silent=True) or {}
+    share, collections, cards, error = _open_shared_deck(share_id, data.get('token'))
+    if error:
+        return error
+
+    term = (data.get('word') or '').strip()
+    definition = (data.get('ans') or '').strip()
+    image_id = data.get('image') or None
+    if not term:
+        return jsonify({"status": 400, "error": "A term is required"}), 400
+    if not definition and not image_id:
+        return jsonify({"status": 400, "error": "A definition or an image is required"}), 400
+    if term not in cards and len(cards) >= MAX_SHARED_DECK_CARDS:
+        return jsonify({
+            "status": 400,
+            "error": f"This deck has reached {MAX_SHARED_DECK_CARDS} cards.",
+        }), 400
+
+    existing = cards.get(term)
+    card = _normalise_card(existing) if existing else _default_card(definition)
+    card['definition'] = definition
+    if image_id:
+        card['image'] = image_id
+    cards[term] = card
+
+    _save_shared_deck(share, collections)
+    return jsonify({"status": 200, "collection": share['collection_name']})
+
+
+@app.route('/api/shares/<share_id>/cards/edit', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def edit_card_in_shared_deck(share_id):
+    """Change a card in a deck shared for editing, including renaming its term."""
+    data = request.get_json(silent=True) or {}
+    share, collections, cards, error = _open_shared_deck(share_id, data.get('token'))
+    if error:
+        return error
+
+    old_term = (data.get('oldword') or '').strip()
+    term = (data.get('word') or '').strip()
+    definition = (data.get('ans') or '').strip()
+    if not old_term or not term:
+        return jsonify({"status": 400, "error": "Missing required fields"}), 400
+    if old_term not in cards:
+        return jsonify({"status": 404, "error": "That card is no longer in the deck"}), 404
+    if not definition and not (data.get('image') or cards.get(old_term, {}).get('image')):
+        return jsonify({"status": 400, "error": "A definition or an image is required"}), 400
+
+    card = _normalise_card(cards[old_term])
+    card['definition'] = definition
+    if 'image' in data:
+        card['image'] = data.get('image') or None
+
+    # Renaming onto an existing card would silently swallow it.
+    if term != old_term and term in cards:
+        return jsonify({"status": 400, "error": f'The deck already has a card called "{term}"'}), 400
+
+    if term != old_term:
+        del cards[old_term]
+    cards[term] = card
+
+    _save_shared_deck(share, collections)
+    return jsonify({"status": 200, "collection": share['collection_name']})
 
 
 @app.route('/api/shares/<share_id>/import', methods=['POST'])
