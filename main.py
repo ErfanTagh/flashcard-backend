@@ -64,6 +64,15 @@ def _default_card(definition):
         # GridFS id of a picture shown with the definition, or None. A card may
         # have text, a picture, or both.
         "image": None,
+        # Who wrote this card, and who last changed it, as account emails.
+        # A deck one person built never shows these; a deck several people
+        # share through a link is the whole reason they are recorded. Every
+        # card written before this existed has None -- see _attribute() for
+        # how those are resolved without a migration over live decks.
+        "created_by": None,
+        "created_at": None,
+        "edited_by": None,
+        "edited_at": None,
         "seen": 0,
         "correct": 0,
         "incorrect": 0,
@@ -88,6 +97,22 @@ def _normalise_card(value):
 
     card = _default_card(definition)
     card["needs_review"] = needs_review
+    return card
+
+
+def _stamp_created(card, email):
+    """Record authorship on a card being written for the first time."""
+    if email and not card.get("created_by"):
+        card["created_by"] = email
+        card["created_at"] = datetime.utcnow().isoformat()
+    return card
+
+
+def _stamp_edited(card, email):
+    """Record who last changed a card."""
+    if email:
+        card["edited_by"] = email
+        card["edited_at"] = datetime.utcnow().isoformat()
     return card
 
 
@@ -121,8 +146,69 @@ def _covers_map(user_doc, collection_names):
     return {name: meta.get(name, {}).get('cover_image') for name in collection_names}
 
 
+AUTHOR_FIELDS = ("created_by", "created_at", "edited_by", "edited_at")
+
+
 def _card_payload(term, card):
-    return {"term": term, **card}
+    """A card as clients see it: authorship is resolved to names elsewhere,
+    and the emails it is stored under never leave the server."""
+    return {"term": term, **{k: v for k, v in card.items() if k not in AUTHOR_FIELDS}}
+
+
+def _names_for(emails):
+    """Display names for a set of accounts, keyed by email."""
+    wanted = {e for e in emails if e}
+    if not wanted or flashcards_collection is None:
+        return {}
+    found = {
+        doc['user_email']: _display_name_of(doc)
+        for doc in flashcards_collection.find(
+            {'user_email': {'$in': list(wanted)}},
+            {'user_email': 1, 'display_name': 1},
+        )
+    }
+    # An account that never set a name, or that no longer exists, still has to
+    # be called something. The part before the @ is the least bad option, and
+    # unlike the address itself it is not something a stranger can write to.
+    return {e: (found.get(e) or e.split('@')[0]) for e in wanted}
+
+
+def _attribute(cards, owner_email, viewer_email):
+    """Card payloads carrying who wrote each card, and whether to show it.
+
+    Returns (payload, multi_author). Authorship is only worth showing when a
+    deck actually has more than one author, so that count is computed here
+    rather than left to each client to work out.
+
+    A card written before authorship was recorded still has an author: the
+    deck belonged to one person before it was ever shared, so an unattributed
+    card is that person's. Resolving it at read time this way means no
+    migration has to run over decks people are studying right now.
+    """
+    creators, editors = {}, {}
+    for term, value in cards.items():
+        card = _normalise_card(value)
+        creator = card.get('created_by') or owner_email
+        editor = card.get('edited_by')
+        creators[term] = creator
+        # An edit by the person who wrote the card says nothing worth a line.
+        editors[term] = editor if editor and editor != creator else None
+
+    contributors = {c for c in creators.values() if c}
+    contributors |= {e for e in editors.values() if e}
+    names = _names_for(contributors)
+
+    payload = []
+    for term, value in cards.items():
+        card = _normalise_card(value)
+        creator, editor = creators[term], editors[term]
+        card['created_by_name'] = names.get(creator)
+        card['created_by_you'] = bool(creator) and creator == viewer_email
+        card['edited_by_name'] = names.get(editor) if editor else None
+        card['edited_by_you'] = bool(editor) and editor == viewer_email
+        payload.append(_card_payload(term, card))
+
+    return payload, len(contributors) > 1
 
 
 # Error handler
@@ -323,6 +409,7 @@ def send_word():
         card['definition'] = ans
         if image_id:
             card['image'] = image_id
+        _stamp_edited(card, token) if existing else _stamp_created(card, token)
         source[word] = card
         _write_shared_card(share, {share['collection_name']: source}, word, card)
         return {"status": 200}
@@ -331,6 +418,7 @@ def send_word():
         # Create new user document with collections structure
         new_card = _default_card(ans)
         new_card['image'] = image_id
+        _stamp_created(new_card, token)
         collections = {collection_name: {word: new_card}}
         flashcards_collection.insert_one({
             'user_email': token,
@@ -350,6 +438,7 @@ def send_word():
         existing = collections[collection_name].get(word)
         card = _normalise_card(existing) if existing else _default_card(ans)
         card['definition'] = ans
+        _stamp_edited(card, token) if existing else _stamp_created(card, token)
         if 'image' in data:
             # Replacing or clearing a picture orphans the old one in GridFS
             # unless it is deleted here.
@@ -449,6 +538,7 @@ def edit_word():
             return jsonify({"status": 404, "error": "Word not found"})
         card = _normalise_card(shared[origin])
         card['definition'] = _normalise_card(ans)['definition']
+        _stamp_edited(card, token)
         if 'image' in data:
             card['image'] = data.get('image') or None
         if word != origin:
@@ -474,6 +564,7 @@ def edit_word():
     incoming = _normalise_card(ans)
     card = _normalise_card(cards[source])
     card['definition'] = incoming['definition']
+    _stamp_edited(card, token)
 
     # Only touched when the caller says so, so a client that knows nothing
     # about images cannot wipe one by editing the text.
@@ -860,10 +951,11 @@ def get_cards():
     if not user_doc:
         return Response(json.dumps({'cards': []}), mimetype='application/json')
 
-    cards, _ = _resolve_collection(user_doc, collection_name)
+    cards, link = _resolve_collection(user_doc, collection_name)
 
-    payload = [_card_payload(term, card) for term, card in cards.items()]
-    return Response(json.dumps({'cards': payload}), mimetype='application/json')
+    payload, multi_author = _attribute(cards, _collection_owner(link, email), email)
+    return Response(json.dumps({'cards': payload, 'multi_author': multi_author}),
+                    mimetype='application/json')
 
 
 @app.route('/api/review', methods=['POST'])
@@ -1262,7 +1354,10 @@ def import_deck_json():
     requested = (data.get('name') or parsed_name or "Imported").strip()
     name = _unique_collection_name(collections, requested)
 
-    collections[name] = {term: _default_card(definition) for term, definition in cards.items()}
+    collections[name] = {
+        term: _stamp_created(_default_card(definition), token)
+        for term, definition in cards.items()
+    }
 
     if user_doc:
         flashcards_collection.update_one(
@@ -1433,6 +1528,14 @@ def _resolve_collection(user_doc, collection_name):
         card['last_reviewed'] = mine.get('last_reviewed')
         merged[term] = card
     return merged, link
+
+
+def _collection_owner(link, viewer_email):
+    """Whose deck this is: the follower's own, or the person they follow."""
+    if link is None or shares_collection is None:
+        return viewer_email
+    share = shares_collection.find_one({'share_id': link.get('share_id')})
+    return (share or {}).get('owner_email') or viewer_email
 
 
 def _followed_write_target(user_doc, token, collection_name):
@@ -1814,6 +1917,8 @@ def add_card_to_shared_deck(share_id):
     card['definition'] = definition
     if image_id:
         card['image'] = image_id
+    editor = data.get('token')
+    _stamp_edited(card, editor) if existing else _stamp_created(card, editor)
     cards[term] = card
 
     _write_shared_card(share, collections, term, card)
@@ -1843,6 +1948,7 @@ def edit_card_in_shared_deck(share_id):
     card['definition'] = definition
     if 'image' in data:
         card['image'] = data.get('image') or None
+    _stamp_edited(card, data.get('token'))
 
     # Renaming onto an existing card would silently swallow it.
     if term != old_term and term in cards:
@@ -1901,6 +2007,12 @@ def import_share(share_id):
         # Fresh cards: the recipient has not studied any of this yet.
         copy = _default_card(card['definition'])
         copy['image'] = _copy_image_for(card['image'], token)
+        # The recipient did not write these; saying they did would be a lie
+        # the moment they add a card of their own beside them.
+        copy['created_by'] = card.get('created_by') or share['owner_email']
+        copy['created_at'] = card.get('created_at')
+        copy['edited_by'] = card.get('edited_by')
+        copy['edited_at'] = card.get('edited_at')
         imported[term] = copy
 
     collections[name] = imported
