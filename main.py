@@ -1188,6 +1188,34 @@ def upload_image():
                     mimetype='application/json')
 
 
+def _follower_may_read_image(email, image_id, owner):
+    """Whether an account may see a picture belonging to someone else.
+
+    A follower reads the owner's cards, so they have to be able to read the
+    pictures those cards answer with -- otherwise a shared deck arrives with
+    holes where its answers should be.
+
+    Deliberately narrow: it is not enough to follow something of the owner's.
+    The picture has to be the answer to a card in a deck this account actually
+    follows, so following one deck does not open the rest of the owner's
+    pictures to them.
+    """
+    if flashcards_collection is None or shares_collection is None:
+        return False
+
+    user_doc = flashcards_collection.find_one({'user_email': email})
+    for link in _linked_collections(user_doc).values():
+        share = shares_collection.find_one({'share_id': link.get('share_id')})
+        if not share or share.get('owner_email') != owner:
+            continue
+        _, source = _shared_source(share)
+        if source is None:
+            continue
+        if any(_normalise_card(v).get('image') == image_id for v in source.values()):
+            return True
+    return False
+
+
 @app.route('/api/images/<image_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
 def get_image(image_id):
@@ -1218,7 +1246,7 @@ def get_image(image_id):
                  if shares_collection is not None else None)
         if not share or (owner and owner != share['owner_email']):
             return jsonify({"status": 404, "error": "Image not found"}), 404
-    elif owner and owner != email:
+    elif owner and owner != email and not _follower_may_read_image(email, image_id, owner):
         return jsonify({"status": 404, "error": "Image not found"}), 404
 
     response = Response(stored.read(), mimetype=stored.content_type or "application/octet-stream")
