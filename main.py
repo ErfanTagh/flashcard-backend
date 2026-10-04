@@ -1817,11 +1817,25 @@ def get_share(share_id):
     # so the page can offer something other than a button that cannot work.
     viewer = request.args.get('email')
 
+    # Following it is the other way a viewer already has this deck. Following
+    # twice has always been refused, but only once the button was pressed -- so
+    # the page spent until then offering to add something the viewer had. The
+    # name is reported too, because a follower may hold it under a different
+    # one if they already had a deck by that name.
+    following_as = None
+    if viewer:
+        viewer_doc = flashcards_collection.find_one({'user_email': viewer})
+        for name, link in _linked_collections(viewer_doc).items():
+            if link.get('share_id') == share_id:
+                following_as = name
+                break
+
     return Response(json.dumps({
         'status': 200,
         'share_id': share_id,
         'collection': share['collection_name'],
         'is_owner': bool(viewer) and viewer == share['owner_email'],
+        'following_as': following_as,
         'allow_edit': bool(share.get('allow_edit')),
         # Read from the account so a changed name shows up on links already
         # out in the world; the copy on the share is only a fallback for links
