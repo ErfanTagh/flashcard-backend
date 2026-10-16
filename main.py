@@ -668,19 +668,12 @@ def get_collections(token):
     if not collection_names:
         collection_names = ['Default']
     default_collection = user_doc.get('default_collection', 'Default') if user_doc else 'Default'
-
-    # Decks offered through a link and not added yet. Listed here so the deck
-    # list is the one place to look for "what do I have, and what is waiting",
-    # rather than the offer living only in whatever message carried the link.
-    offers, stale = _resolve_pending_shares(user_doc)
-    _forget_pending_shares(token, stale)
-
+    
     return Response(json.dumps({
         'collections': collection_names,
         'default_collection': default_collection,
         'covers': _covers_map(user_doc, collection_names),
         'linked': list(linked.keys()),
-        'offers': offers,
     }), mimetype='application/json')
 
 
@@ -1515,60 +1508,6 @@ def _linked_collections(user_doc):
     return (user_doc or {}).get('linked_collections') or {}
 
 
-def _pending_shares(user_doc):
-    """Share links this account has opened but not added."""
-    return (user_doc or {}).get('pending_shares') or {}
-
-
-def _resolve_pending_shares(user_doc):
-    """Decks offered to this account, ready to list beside the real ones.
-
-    Returns (offers, stale). An offer goes stale the moment it stops being an
-    offer: the link was revoked, the deck deleted, or the account has since
-    followed it or turned out to own it. Callers forget the stale ones rather
-    than showing an Add button that cannot work.
-    """
-    pending = _pending_shares(user_doc)
-    if not pending or shares_collection is None:
-        return [], []
-
-    email = (user_doc or {}).get('user_email')
-    followed = {link.get('share_id') for link in _linked_collections(user_doc).values()}
-
-    offers, stale = [], []
-    for share_id in pending:
-        if share_id in followed:
-            stale.append(share_id)
-            continue
-        share = shares_collection.find_one({'share_id': share_id})
-        if not share or share.get('owner_email') == email:
-            stale.append(share_id)
-            continue
-        owner_doc, cards = _shared_source(share)
-        if cards is None:
-            stale.append(share_id)
-            continue
-        offers.append({
-            'share_id': share_id,
-            'collection': share['collection_name'],
-            'owner_name': _display_name_of(owner_doc) or share.get('owner_name'),
-            'card_count': len(cards),
-            'cover': _cover_of(owner_doc, share['collection_name']),
-        })
-
-    return offers, stale
-
-
-def _forget_pending_shares(email, share_ids):
-    """Drop offers that are no longer offers."""
-    if not share_ids or flashcards_collection is None:
-        return
-    flashcards_collection.update_one(
-        {'user_email': email},
-        {'$unset': {f'pending_shares.{share_id}': "" for share_id in share_ids}},
-    )
-
-
 def _shared_source(share):
     """The cards behind a share, or None if it no longer resolves."""
     if flashcards_collection is None or not share:
@@ -1657,68 +1596,6 @@ def _followed_write_target(user_doc, token, collection_name):
     return share, None
 
 
-@app.route('/api/shares/<share_id>/seen', methods=['POST'])
-@cross_origin(headers=["Content-Type", "Authorization"])
-def remember_share(share_id):
-    """Remember that this account has been offered a deck.
-
-    Opening a link and not adding it straight away used to lose it: the only
-    way back was the link itself. Recording it here lets the deck list show it
-    as something on offer, so it can be added later without hunting for the
-    message it arrived in.
-    """
-    if flashcards_collection is None or shares_collection is None:
-        return jsonify({"status": 500, "error": "Database not connected"}), 500
-
-    data = request.get_json(silent=True) or {}
-    token = data.get('token')
-    if not token:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
-
-    share = shares_collection.find_one({'share_id': share_id})
-    if not share:
-        return jsonify({"status": 404, "error": "This link is no longer available"}), 404
-    # Nothing to offer someone who owns it or already has it.
-    if share['owner_email'] == token:
-        return jsonify({"status": 200, "remembered": False})
-
-    user_doc = flashcards_collection.find_one({'user_email': token})
-    if any(link.get('share_id') == share_id for link in _linked_collections(user_doc).values()):
-        return jsonify({"status": 200, "remembered": False})
-
-    seen_at = datetime.utcnow().isoformat()
-    if user_doc:
-        flashcards_collection.update_one(
-            {'user_email': token},
-            {'$set': {f'pending_shares.{share_id}': {'seen_at': seen_at}}},
-        )
-    else:
-        flashcards_collection.insert_one({
-            'user_email': token,
-            'collections': {},
-            'pending_shares': {share_id: {'seen_at': seen_at}},
-            'default_collection': 'Default',
-            'created_at': datetime.utcnow(),
-        })
-    return jsonify({"status": 200, "remembered": True})
-
-
-@app.route('/api/shares/<share_id>/dismiss', methods=['POST'])
-@cross_origin(headers=["Content-Type", "Authorization"])
-def dismiss_share(share_id):
-    """Stop offering a deck in this account's list. The link still works."""
-    if flashcards_collection is None:
-        return jsonify({"status": 500, "error": "Database not connected"}), 500
-
-    data = request.get_json(silent=True) or {}
-    token = data.get('token')
-    if not token:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
-
-    _forget_pending_shares(token, [share_id])
-    return jsonify({"status": 200})
-
-
 @app.route('/api/shares/<share_id>/follow', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
 def follow_share(share_id):
@@ -1770,9 +1647,6 @@ def follow_share(share_id):
             'default_collection': name,
             'created_at': datetime.utcnow(),
         })
-
-    # It is theirs now, so it is no longer something being offered to them.
-    _forget_pending_shares(token, [share_id])
 
     return jsonify({"status": 200, "collection": name, "cards": len(source)})
 
