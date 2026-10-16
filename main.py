@@ -668,12 +668,20 @@ def get_collections(token):
     if not collection_names:
         collection_names = ['Default']
     default_collection = user_doc.get('default_collection', 'Default') if user_doc else 'Default'
-    
+
+    # Which of these decks are listed in the public library, so the deck list
+    # can offer to take one back out without asking a second endpoint.
+    published = []
+    if shares_collection is not None:
+        published = [s['collection_name'] for s in shares_collection.find(
+            {'owner_email': token, 'public': True}, {'collection_name': 1})]
+
     return Response(json.dumps({
         'collections': collection_names,
         'default_collection': default_collection,
         'covers': _covers_map(user_doc, collection_names),
         'linked': list(linked.keys()),
+        'published': published,
     }), mimetype='application/json')
 
 
@@ -1699,8 +1707,122 @@ def _share_payload(share):
         "share_id": share["share_id"],
         "collection": share["collection_name"],
         "allow_edit": bool(share.get("allow_edit")),
+        "public": bool(share.get("public")),
         "path": _share_url_path(share["share_id"]),
     }
+
+
+# The public library
+#
+# A published deck is an ordinary share that agreed to be listed. Everything
+# that already works for a link -- following it, live updates, private
+# progress, the preview page -- works here unchanged; the only new thing is
+# being findable without being sent the link.
+
+
+MIN_PUBLISHED_CARDS = 3
+
+
+@app.route('/api/collections/<collection_name>/publish', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def publish_collection(collection_name):
+    """List a deck in the public library, or take it back out."""
+    if flashcards_collection is None or shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    data = request.get_json(silent=True) or {}
+    token = data.get('token')
+    if not token:
+        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    wanted = bool(data.get('public', True))
+
+    user_doc = flashcards_collection.find_one({'user_email': token})
+    if not user_doc:
+        return jsonify({"status": 404, "error": "User not found"}), 404
+
+    collections = migrate_user_to_collections(user_doc)
+    cards = collections.get(collection_name)
+    if cards is None:
+        return jsonify({"status": 404, "error": "Collection not found"}), 404
+
+    existing = shares_collection.find_one({
+        'owner_email': token, 'collection_name': collection_name,
+    })
+
+    if not wanted:
+        if existing:
+            shares_collection.update_one({'_id': existing['_id']}, {'$set': {'public': False}})
+            existing['public'] = False
+            return Response(json.dumps({"status": 200, **_share_payload(existing)}),
+                            mimetype='application/json')
+        return jsonify({"status": 200, "public": False})
+
+    # An all but empty deck in a public list is noise for everyone browsing it.
+    if len(cards) < MIN_PUBLISHED_CARDS:
+        return jsonify({
+            "status": 400,
+            "error": f"A deck needs at least {MIN_PUBLISHED_CARDS} cards before it can be published.",
+        }), 400
+
+    if existing:
+        # Publishing deliberately does not turn on editing. A link is given to
+        # people the owner chose; the library is open to everyone, and letting
+        # strangers rewrite a deck is not what "publish" asks for.
+        shares_collection.update_one({'_id': existing['_id']}, {'$set': {'public': True}})
+        existing['public'] = True
+        share = existing
+    else:
+        share = {
+            'share_id': secrets.token_urlsafe(9),
+            'owner_email': token,
+            'owner_name': _display_name_of(user_doc),
+            'collection_name': collection_name,
+            'allow_edit': False,
+            'public': True,
+            'created_at': datetime.utcnow(),
+        }
+        shares_collection.insert_one(share)
+
+    return Response(json.dumps({"status": 200, **_share_payload(share)}),
+                    mimetype='application/json')
+
+
+@app.route('/api/public/decks', methods=['GET'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+def list_public_decks():
+    """Every deck anyone has published.
+
+    A viewer that says who it is gets told which ones it already has, so the
+    library can show those as settled rather than offering them again.
+    """
+    if flashcards_collection is None or shares_collection is None:
+        return jsonify({"status": 500, "error": "Database not connected"}), 500
+
+    viewer = request.args.get('email')
+    viewer_doc = flashcards_collection.find_one({'user_email': viewer}) if viewer else None
+    followed = {link.get('share_id') for link in _linked_collections(viewer_doc).values()}
+
+    decks = []
+    for share in shares_collection.find({'public': True}):
+        owner_doc, cards = _shared_source(share)
+        # Published then deleted, or renamed out from under the listing: not
+        # something anyone can add, so not something anyone should see.
+        if cards is None or len(cards) < MIN_PUBLISHED_CARDS:
+            continue
+        decks.append({
+            'share_id': share['share_id'],
+            'collection': share['collection_name'],
+            'owner_name': _display_name_of(owner_doc) or share.get('owner_name'),
+            'card_count': len(cards),
+            'cover': _cover_of(owner_doc, share['collection_name']),
+            'mine': share['owner_email'] == viewer,
+            'following': share['share_id'] in followed,
+        })
+
+    # Biggest first: with nothing else to go on, the deck somebody put the most
+    # work into is the better thing to show at the top of an empty library.
+    decks.sort(key=lambda d: (-d['card_count'], d['collection'].lower()))
+    return Response(json.dumps({'status': 200, 'decks': decks}), mimetype='application/json')
 
 
 @app.route('/api/collections/<collection_name>/share', methods=['POST'])
