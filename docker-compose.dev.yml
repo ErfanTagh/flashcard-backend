@@ -45,6 +45,14 @@ services:
             - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
             - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
             - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
+            # A bind mount from macOS delivers no filesystem events into the
+            # container, so Tailwind never re-scans an edited file and classes
+            # added since the server started are simply never generated -- the
+            # markup is right and the styles are missing. Vite already polls;
+            # this is the same switch for every chokidar-based watcher behind
+            # it, Tailwind's content scanning included.
+            - CHOKIDAR_USEPOLLING=true
+            - CHOKIDAR_INTERVAL=300
         depends_on:
             - backend
         networks:
