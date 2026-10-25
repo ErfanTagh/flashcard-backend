@@ -23,6 +23,12 @@ services:
             - MONGO_DATABASE=flashcards
             - MONGO_USERNAME=admin
             - MONGO_PASSWORD=password
+            # Local development has no Auth0 round trip, so the frontend sends
+            # the signed-in address in an X-Dev-User header instead of a token.
+            # The API honours that header only because of this switch, and
+            # refuses to honour it at all when FLASK_ENV says production. It
+            # must never be set on the server.
+            - RECALLCARDS_DEV_AUTH=true
         depends_on:
             - mongodb
         networks:

@@ -10,9 +10,8 @@ import random
 import secrets
 from flask_cors import cross_origin
 from pymongo import MongoClient
-from functools import wraps
-from six.moves.urllib.request import urlopen
-from jose import jwt
+# Identity comes from a verified Auth0 token, never from a request parameter.
+from auth import AuthError, caller_email, optional_auth, requires_auth
 
 app = Flask(__name__)
 
@@ -46,10 +45,6 @@ except Exception as e:
     flashcards_collection = None
     images = None
     shares_collection = None
-
-AUTH0_DOMAIN = 'dev-43bumhcy.us.auth0.com'
-API_AUDIENCE = 'recallcards'
-ALGORITHMS = ["RS256"]
 
 # Cards were originally stored as a bare definition string, with "needs review"
 # encoded by appending this sentinel to that string. They are now stored as
@@ -211,13 +206,8 @@ def _attribute(cards, owner_email, viewer_email):
     return payload, len(contributors) > 1
 
 
-# Error handler
-class AuthError(Exception):
-    def __init__(self, error, status_code):
-        self.error = error
-        self.status_code = status_code
-
-
+# Error handler. AuthError itself, and the token verification that raises it,
+# now live in auth.py.
 @app.errorhandler(AuthError)
 def handle_auth_error(ex):
     response = jsonify(ex.error)
@@ -225,100 +215,16 @@ def handle_auth_error(ex):
     return response
 
 
-# /server.py
-
-# Format error response and append status code
-def get_token_auth_header():
-    """Obtains the Access Token from the Authorization Header
-    """
-    auth = request.headers.get("Authorization", None)
-    if not auth:
-        raise AuthError({"code": "authorization_header_missing",
-                         "description":
-                             "Authorization header is expected"}, 401)
-
-    parts = auth.split()
-
-    if parts[0].lower() != "bearer":
-        raise AuthError({"code": "invalid_header",
-                         "description":
-                             "Authorization header must start with"
-                             " Bearer"}, 401)
-    elif len(parts) == 1:
-        raise AuthError({"code": "invalid_header",
-                         "description": "Token not found"}, 401)
-    elif len(parts) > 2:
-        raise AuthError({"code": "invalid_header",
-                         "description":
-                             "Authorization header must be"
-                             " Bearer token"}, 401)
-
-    token = parts[1]
-    return token
-
-
-def requires_auth(f):
-    """Determines if the Access Token is valid
-    """
-
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = get_token_auth_header()
-        jsonurl = urlopen("https://" + AUTH0_DOMAIN + "/.well-known/jwks.json")
-        jwks = json.loads(jsonurl.read())
-        unverified_header = jwt.get_unverified_header(token)
-        rsa_key = {}
-        for key in jwks["keys"]:
-            if key["kid"] == unverified_header["kid"]:
-                rsa_key = {
-                    "kty": key["kty"],
-                    "kid": key["kid"],
-                    "use": key["use"],
-                    "n": key["n"],
-                    "e": key["e"]
-                }
-        if rsa_key:
-            try:
-                payload = jwt.decode(
-                    token,
-                    rsa_key,
-                    algorithms=ALGORITHMS,
-                    audience=API_AUDIENCE,
-                    issuer="https://" + AUTH0_DOMAIN + "/"
-                )
-            except jwt.ExpiredSignatureError:
-                raise AuthError({"code": "token_expired",
-                                 "description": "token is expired"}, 401)
-            except jwt.JWTClaimsError:
-                raise AuthError({"code": "invalid_claims",
-                                 "description":
-                                     "incorrect claims,"
-                                     "please check the audience and issuer"}, 401)
-            except Exception:
-                raise AuthError({"code": "invalid_header",
-                                 "description":
-                                     "Unable to parse authentication"
-                                     " token."}, 401)
-
-            request.current_user = payload
-            return f(*args, **kwargs)
-        raise AuthError({"code": "invalid_header",
-                         "description": "Unable to find appropriate key"}, 401)
-
-    return decorated
-
-
 @app.route('/api/words', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def allwords():
     if flashcards_collection is None:
         return Response(json.dumps({}), mimetype='application/json')
 
     # Scoped to a single user. This used to iterate the whole collection and
     # return every account's cards to any caller.
-    email = request.args.get('email')
-    if not email:
-        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+    email = caller_email()
 
     user_doc = flashcards_collection.find_one({'user_email': email})
     if not user_doc:
@@ -334,7 +240,10 @@ def allwords():
 
 @app.route('/api/words/rand/<token>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def getwordrand(token):
+    # The address in the path is ignored. The caller is whoever the token says.
+    token = caller_email()
     if flashcards_collection is None:
         return json.dumps(["You Don't Have Anything to Memorize ", "Please Add Cards!"])
     
@@ -372,15 +281,16 @@ def getwordrand(token):
 
 @app.route('/api/sendwords', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def send_word():
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"})
     
     data = request.get_json(silent=True)
-    if not data or 'token' not in data or 'word' not in data or 'ans' not in data:
+    if not data or 'word' not in data or 'ans' not in data:
         return jsonify({"status": 400, "error": "Missing required fields"})
     
-    token = data['token']
+    token = caller_email()
     word = data['word']
     ans = data['ans']
     image_id = data.get('image') or None
@@ -463,15 +373,14 @@ def send_token():
 
 @app.route('/api/delword/<word>', methods=['DELETE'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def del_word(word):
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"})
     
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"})
+    data = request.get_json(silent=True) or {}
     
-    token = data['token']
+    token = caller_email()
     collection_name = data.get('collection', 'Default')
     
     user_doc = flashcards_collection.find_one({'user_email': token})
@@ -507,15 +416,16 @@ def del_word(word):
 
 @app.route('/api/editword', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def edit_word():
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"})
     
     data = request.get_json(silent=True)
-    if not data or 'token' not in data or 'oldword' not in data or 'word' not in data or 'ans' not in data:
+    if not data or 'oldword' not in data or 'word' not in data or 'ans' not in data:
         return jsonify({"status": 400, "error": "Missing required fields"})
     
-    token = data['token']
+    token = caller_email()
     oldWord = data['oldword']
     word = data['word']
     ans = data['ans']
@@ -634,8 +544,11 @@ def migrate_user_to_collections(user_doc):
 
 @app.route('/api/collections/<token>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def get_collections(token):
     """Get all collections for a user"""
+    # The address in the path is ignored. The caller is whoever the token says.
+    token = caller_email()
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
@@ -687,16 +600,17 @@ def get_collections(token):
 
 @app.route('/api/collections', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def create_collection():
     """Create a new collection"""
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
     data = request.get_json(silent=True)
-    if not data or 'token' not in data or 'collection_name' not in data:
+    if not data or 'collection_name' not in data:
         return {"status": 400, "error": "Missing required fields"}
     
-    token = data['token']
+    token = caller_email()
     collection_name = data['collection_name'].strip()
     
     if not collection_name:
@@ -731,6 +645,7 @@ def create_collection():
 
 @app.route('/api/collections/<collection_name>', methods=['DELETE'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def delete_collection(collection_name):
     """Delete a collection"""
     if flashcards_collection is None:
@@ -740,7 +655,7 @@ def delete_collection(collection_name):
     if not data or 'token' not in data:
         return {"status": 400, "error": "Missing token in request body"}
     
-    token = data['token']
+    token = caller_email()
     
     if collection_name == 'Default':
         return {"status": 400, "error": "Cannot delete Default collection"}
@@ -795,16 +710,17 @@ def delete_collection(collection_name):
 
 @app.route('/api/collections/default', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def set_default_collection():
     """Set the default collection"""
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
     data = request.get_json(silent=True)
-    if not data or 'token' not in data or 'collection_name' not in data:
+    if not data or 'collection_name' not in data:
         return {"status": 400, "error": "Missing required fields"}
     
-    token = data['token']
+    token = caller_email()
     collection_name = data['collection_name']
     
     user_doc = flashcards_collection.find_one({'user_email': token})
@@ -827,6 +743,7 @@ def set_default_collection():
 
 @app.route('/api/collections/<old_collection_name>/rename', methods=['PUT'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def rename_collection(old_collection_name):
     """Rename a collection"""
     if flashcards_collection is None:
@@ -836,7 +753,7 @@ def rename_collection(old_collection_name):
     if not data or 'token' not in data or 'new_collection_name' not in data:
         return {"status": 400, "error": "Missing required fields"}
     
-    token = data['token']
+    token = caller_email()
     new_collection_name = data['new_collection_name'].strip()
     
     if not new_collection_name:
@@ -891,8 +808,11 @@ def rename_collection(old_collection_name):
 
 @app.route('/api/collections/<token>/stats', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def get_collection_stats(token):
     """Get statistics for all collections (card counts)"""
+    # The address in the path is ignored. The caller is whoever the token says.
+    token = caller_email()
     if flashcards_collection is None:
         return {"status": 500, "error": "Database not connected"}
     
@@ -944,14 +864,13 @@ def get_collection_stats(token):
 
 @app.route('/api/cards', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def get_cards():
     """Every card in a collection, with its review history."""
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    email = request.args.get('email')
-    if not email:
-        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+    email = caller_email()
 
     collection_name = request.args.get('collection', 'Default')
 
@@ -968,6 +887,7 @@ def get_cards():
 
 @app.route('/api/review', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def record_review():
     """Record the outcome of studying one card."""
     if flashcards_collection is None:
@@ -981,7 +901,7 @@ def record_review():
     if outcome not in ('correct', 'incorrect'):
         return jsonify({"status": 400, "error": "outcome must be 'correct' or 'incorrect'"})
 
-    token = data['token']
+    token = caller_email()
     word = data['word']
     collection_name = data.get('collection', 'Default')
 
@@ -1052,14 +972,13 @@ def record_review():
 
 @app.route('/api/progress', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def get_progress():
     """Real study statistics, derived from recorded review outcomes."""
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    email = request.args.get('email')
-    if not email:
-        return jsonify({"status": 400, "error": "email query parameter is required"}), 400
+    email = caller_email()
 
     collection_name = request.args.get('collection', 'Default')
 
@@ -1160,6 +1079,7 @@ def handle_too_large(error):
 
 @app.route('/api/images', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def upload_image():
     """Store a picture and return the id a card refers to it by."""
     if images is None:
@@ -1226,6 +1146,7 @@ def _follower_may_read_image(email, image_id, owner):
 
 @app.route('/api/images/<image_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@optional_auth
 def get_image(image_id):
     """Serve a stored picture.
 
@@ -1235,10 +1156,10 @@ def get_image(image_id):
     if images is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    email = request.args.get('email')
+    email = caller_email()
     share_id = request.args.get('share')
     if not email and not share_id:
-        return jsonify({"status": 400, "error": "email or share query parameter is required"}), 400
+        return jsonify({"status": 401, "error": "Sign in, or come through a share link"}), 401
 
     try:
         stored = images.get(ObjectId(image_id))
@@ -1365,16 +1286,15 @@ def parse_deck_json(payload):
 
 @app.route('/api/collections/import', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def import_deck_json():
     """Create a deck from a JSON document."""
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    data = request.get_json(silent=True) or {}
 
-    token = data['token']
+    token = caller_email()
     payload = data.get('deck')
     if payload is None:
         return jsonify({"status": 400, "error": "Missing deck in request body"}), 400
@@ -1418,6 +1338,7 @@ def import_deck_json():
 
 @app.route('/api/profile', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def save_profile():
     """Record who an email address belongs to.
 
@@ -1433,11 +1354,9 @@ def save_profile():
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    data = request.get_json(silent=True) or {}
 
-    token = data['token']
+    token = caller_email()
     name = (data.get('name') or '').strip()[:60]
 
     update = {'updated_at': datetime.utcnow()}
@@ -1455,6 +1374,7 @@ def save_profile():
 
 @app.route('/api/collections/<collection_name>/cover', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def set_collection_cover(collection_name):
     """Set or clear a deck's cover picture.
 
@@ -1464,11 +1384,9 @@ def set_collection_cover(collection_name):
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    data = request.get_json(silent=True) or {}
 
-    token = data['token']
+    token = caller_email()
     image_id = data.get('image') or None
 
     user_doc = flashcards_collection.find_one({'user_email': token})
@@ -1606,15 +1524,13 @@ def _followed_write_target(user_doc, token, collection_name):
 
 @app.route('/api/shares/<share_id>/follow', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def follow_share(share_id):
     """Add a shared deck to an account without copying it."""
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True) or {}
-    token = data.get('token')
-    if not token:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    token = caller_email()
 
     share = shares_collection.find_one({'share_id': share_id})
     if not share:
@@ -1661,15 +1577,13 @@ def follow_share(share_id):
 
 @app.route('/api/collections/<collection_name>/unfollow', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def unfollow_collection(collection_name):
     """Stop following a shared deck. The owner's deck is untouched."""
     if flashcards_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True) or {}
-    token = data.get('token')
-    if not token:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    token = caller_email()
 
     user_doc = flashcards_collection.find_one({'user_email': token})
     links = dict(_linked_collections(user_doc))
@@ -1725,15 +1639,14 @@ MIN_PUBLISHED_CARDS = 3
 
 @app.route('/api/collections/<collection_name>/publish', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def publish_collection(collection_name):
     """List a deck in the public library, or take it back out."""
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
     data = request.get_json(silent=True) or {}
-    token = data.get('token')
-    if not token:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    token = caller_email()
     wanted = bool(data.get('public', True))
 
     user_doc = flashcards_collection.find_one({'user_email': token})
@@ -1789,6 +1702,7 @@ def publish_collection(collection_name):
 
 @app.route('/api/public/decks', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@optional_auth
 def list_public_decks():
     """Every deck anyone has published.
 
@@ -1798,7 +1712,7 @@ def list_public_decks():
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    viewer = request.args.get('email')
+    viewer = caller_email()
     viewer_doc = flashcards_collection.find_one({'user_email': viewer}) if viewer else None
     followed = {link.get('share_id') for link in _linked_collections(viewer_doc).values()}
 
@@ -1827,16 +1741,15 @@ def list_public_decks():
 
 @app.route('/api/collections/<collection_name>/share', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def share_collection(collection_name):
     """Create a share link for a collection, or return the one it already has."""
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    data = request.get_json(silent=True) or {}
 
-    token = data['token']
+    token = caller_email()
     # Accepted for clients that send it inline, but the account's own name wins:
     # see /api/profile.
     display_name = (data.get('display_name') or '').strip()[:60] or None
@@ -1886,17 +1799,14 @@ def share_collection(collection_name):
 
 @app.route('/api/collections/<collection_name>/share', methods=['DELETE'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def unshare_collection(collection_name):
     """Revoke a share link. Copies already taken are unaffected."""
     if shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
-
     result = shares_collection.delete_one({
-        'owner_email': data['token'], 'collection_name': collection_name,
+        'owner_email': caller_email(), 'collection_name': collection_name,
     })
     if result.deleted_count == 0:
         return jsonify({"status": 404, "error": "That collection is not shared"}), 404
@@ -1905,6 +1815,7 @@ def unshare_collection(collection_name):
 
 @app.route('/api/shares/<share_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@optional_auth
 def get_share(share_id):
     """What is behind a share link. Deliberately open: holding the link is the
     permission, and a recipient has to see what they are importing first."""
@@ -1937,7 +1848,7 @@ def get_share(share_id):
 
     # A viewer that says who it is gets told whether the deck is already theirs,
     # so the page can offer something other than a button that cannot work.
-    viewer = request.args.get('email')
+    viewer = caller_email()
 
     # Following it is the other way a viewer already has this deck. Following
     # twice has always been refused, but only once the button was pressed -- so
@@ -2049,6 +1960,7 @@ def _write_shared_card(share, collections, term, card, replaced_term=None):
 
 @app.route('/api/shares/<share_id>/cards', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def add_card_to_shared_deck(share_id):
     """Add a card to a deck shared for editing.
 
@@ -2059,7 +1971,7 @@ def add_card_to_shared_deck(share_id):
     the owner.
     """
     data = request.get_json(silent=True) or {}
-    share, collections, cards, error = _open_shared_deck(share_id, data.get('token'))
+    share, collections, cards, error = _open_shared_deck(share_id, caller_email())
     if error:
         return error
 
@@ -2081,7 +1993,7 @@ def add_card_to_shared_deck(share_id):
     card['definition'] = definition
     if image_id:
         card['image'] = image_id
-    editor = data.get('token')
+    editor = caller_email()
     _stamp_edited(card, editor) if existing else _stamp_created(card, editor)
     cards[term] = card
 
@@ -2091,10 +2003,11 @@ def add_card_to_shared_deck(share_id):
 
 @app.route('/api/shares/<share_id>/cards/edit', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def edit_card_in_shared_deck(share_id):
     """Change a card in a deck shared for editing, including renaming its term."""
     data = request.get_json(silent=True) or {}
-    share, collections, cards, error = _open_shared_deck(share_id, data.get('token'))
+    share, collections, cards, error = _open_shared_deck(share_id, caller_email())
     if error:
         return error
 
@@ -2112,7 +2025,7 @@ def edit_card_in_shared_deck(share_id):
     card['definition'] = definition
     if 'image' in data:
         card['image'] = data.get('image') or None
-    _stamp_edited(card, data.get('token'))
+    _stamp_edited(card, caller_email())
 
     # Renaming onto an existing card would silently swallow it.
     if term != old_term and term in cards:
@@ -2128,16 +2041,15 @@ def edit_card_in_shared_deck(share_id):
 
 @app.route('/api/shares/<share_id>/import', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def import_share(share_id):
     """Copy a shared collection into the caller's account."""
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
-    data = request.get_json(silent=True)
-    if not data or 'token' not in data:
-        return jsonify({"status": 400, "error": "Missing token in request body"}), 400
+    data = request.get_json(silent=True) or {}
 
-    token = data['token']
+    token = caller_email()
     share = shares_collection.find_one({'share_id': share_id})
     if not share:
         return jsonify({"status": 404, "error": "This link is no longer available"}), 404
@@ -2337,6 +2249,7 @@ def grade_answer(answer, definition):
 
 @app.route('/api/quiz/grade', methods=['POST'])
 @cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
 def grade_quiz_answer():
     """Grade a typed answer against a stored card.
 
@@ -2348,10 +2261,10 @@ def grade_quiz_answer():
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
     data = request.get_json(silent=True)
-    if not data or 'token' not in data or 'word' not in data or 'answer' not in data:
+    if not data or 'word' not in data or 'answer' not in data:
         return jsonify({"status": 400, "error": "Missing required fields"}), 400
 
-    token = data['token']
+    token = caller_email()
     word = data['word']
     collection_name = data.get('collection', 'Default')
 

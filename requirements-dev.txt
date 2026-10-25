@@ -1,0 +1,9 @@
+# Test-only dependencies. The app itself needs nothing beyond requirements.txt.
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#   python -m unittest discover -p 'test_*.py'
+#
+# cryptography signs real tokens in the auth tests rather than mocking the
+# signature check; mongomock stands in for MongoDB in the isolation tests.
+cryptography>=41.0.0
+mongomock>=4.1.2
