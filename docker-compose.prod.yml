@@ -1,0 +1,77 @@
+# RecallCards on the shared gateway box (app #4), per my-simple-resume/SERVER-HANDOFF.md.
+#
+# Deliberately different from docker-compose.yml (the friend's-box layout):
+#   - no published host ports: the gateway reaches recallcards-frontend by name
+#     over recallcards-net, the same way it reaches the other three apps
+#   - its own network and its own MongoDB, shared with nothing
+#   - container names prefixed recallcards- so they cannot collide with the
+#     stale flashcard-* containers that may still exist on that box
+#
+# The gateway terminates TLS and proxies recallcards.net -> recallcards-frontend:80.
+# That frontend nginx serves the SPA and proxies /api/ to the backend, so the
+# gateway only needs one upstream.
+
+services:
+  mongodb:
+    image: mongo:7
+    container_name: recallcards-mongodb
+    restart: always
+    # No ports: reachable only from inside recallcards-net. Nothing on the host
+    # or the internet can touch it.
+    volumes:
+      - recallcards_mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_USERNAME:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_PASSWORD:?set MONGO_PASSWORD in .env}
+    networks:
+      - recallcards-net
+
+  backend:
+    build: .
+    container_name: recallcards-backend
+    restart: always
+    environment:
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DATABASE=${MONGO_DATABASE:-flashcards}
+      - MONGO_USERNAME=${MONGO_USERNAME:-admin}
+      - MONGO_PASSWORD=${MONGO_PASSWORD:?set MONGO_PASSWORD in .env}
+      # Who the API trusts tokens from. auth.py defaults to these, but set them
+      # explicitly so a tenant change is one edit here.
+      - AUTH0_DOMAIN=${AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
+      - AUTH0_AUDIENCE=${AUTH0_AUDIENCE:-recallcards}
+      # Production. This alone makes the dev-auth bypass refuse to run even if
+      # the next line were ever added by mistake.
+      - FLASK_ENV=production
+      # RECALLCARDS_DEV_AUTH is deliberately ABSENT. Setting it here reopens the
+      # authentication hole the app was just fixed for. Never add it on a server.
+    depends_on:
+      - mongodb
+    networks:
+      - recallcards-net
+
+  frontend:
+    build:
+      context: ../flashcard-frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
+        - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
+        - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
+    container_name: recallcards-frontend
+    restart: always
+    # No ports here either. The gateway proxies to recallcards-frontend:80 over
+    # the network; nginx inside this image already listens on 80 and carries the
+    # 6M client_max_body_size so card-picture uploads are not capped at 1MB.
+    depends_on:
+      - backend
+    networks:
+      - recallcards-net
+
+volumes:
+  recallcards_mongo_data:
+
+networks:
+  recallcards-net:
+    external: true
+    name: recallcards-net
