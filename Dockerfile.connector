@@ -1,0 +1,12 @@
+# RecallCards MCP connector -- a standalone service, independent of the Flask
+# backend's image and Python version. See connector/server.py.
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements-connector.txt .
+RUN pip install --no-cache-dir -r requirements-connector.txt
+
+COPY connector/ ./connector/
+
+EXPOSE 8100
+CMD ["python", "-m", "connector.server"]

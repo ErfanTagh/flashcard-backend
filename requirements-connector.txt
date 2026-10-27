@@ -1,0 +1,7 @@
+# The MCP connector runs as its own Python 3.11 service (the Flask backend is
+# still 3.9). It needs only the MCP SDK and a Mongo driver for its OAuth tokens;
+# all card data goes through the REST API over HTTP. mcp brings starlette, anyio,
+# pydantic and httpx with it.
+mcp>=2.3,<3
+pymongo>=4.6,<5
+uvicorn>=0.30,<1

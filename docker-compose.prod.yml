@@ -68,6 +68,39 @@ services:
     networks:
       - recallcards-net
 
+  # The MCP connector for Claude. Its own Python 3.11 image (the backend is 3.9).
+  # It calls the REST API over the network for all card data and touches Mongo
+  # only for its own OAuth tokens. The gateway proxies /mcp and /connector/* here.
+  connector:
+    build:
+      context: .
+      dockerfile: Dockerfile.connector
+    container_name: recallcards-connector
+    restart: always
+    environment:
+      - MONGO_HOST=mongodb
+      - MONGO_PORT=27017
+      - MONGO_DATABASE=${MONGO_DATABASE:-flashcards}
+      - MONGO_USERNAME=${MONGO_USERNAME:-admin}
+      - MONGO_PASSWORD=${MONGO_PASSWORD:?set MONGO_PASSWORD in .env}
+      # Auth0: the connector signs users in through Auth0 and gets an API token.
+      - AUTH0_DOMAIN=${AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
+      - CONNECTOR_AUTH0_AUDIENCE=${AUTH0_AUDIENCE:-recallcards}
+      # Empty until the Auth0 connector app exists; the server boots and serves
+      # OAuth metadata, and only the login step needs these.
+      - CONNECTOR_AUTH0_CLIENT_ID=${CONNECTOR_AUTH0_CLIENT_ID:-}
+      - CONNECTOR_AUTH0_CLIENT_SECRET=${CONNECTOR_AUTH0_CLIENT_SECRET:-}
+      # Public identity + where the API lives on the network.
+      - CONNECTOR_PUBLIC_URL=https://recallcards.net
+      - CONNECTOR_SITE_URL=https://recallcards.net
+      - CONNECTOR_ALLOWED_HOSTS=recallcards.net,www.recallcards.net
+      - CONNECTOR_API_URL=http://recallcards-backend:5000
+    depends_on:
+      - backend
+      - mongodb
+    networks:
+      - recallcards-net
+
 volumes:
   recallcards_mongo_data:
 
