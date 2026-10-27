@@ -62,6 +62,16 @@ jobs:
             code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 8 https://recallcards.net/api/public/decks || true)
             echo "api /api/public/decks -> ${code:-no-response}"
 
+            # The MCP connector lives in this repo too; rebuild and restart it.
+            # Its own container, on the same network; the gateway re-resolves it.
+            docker compose -f docker-compose.prod.yml up -d --build --no-deps connector
+            sleep 5
+            if [ "$(docker inspect -f '{{.State.Running}}' recallcards-connector)" != "true" ]; then
+              echo "::error::recallcards-connector is not running after deploy"
+              docker logs --tail 50 recallcards-connector || true
+              exit 1
+            fi
+
             # Reclaim only this project's dangling images.
             docker image prune -f \
               --filter "label=com.docker.compose.project=flashcard-backend" \

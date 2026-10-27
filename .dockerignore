@@ -1,0 +1,17 @@
+# The backend image is the Flask app only. Keep the connector, test files, the
+# local venv and compose/docs out of its build context so a connector-only
+# change does not rebuild and recreate the backend.
+.git
+.github
+.erf
+__pycache__
+**/__pycache__
+*.pyc
+connector/
+Dockerfile.connector
+requirements-connector.txt
+docker-compose*.yml
+test_*.py
+*.md
+.env
+.env.*
