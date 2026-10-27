@@ -7,47 +7,64 @@ on:
       - master
   workflow_dispatch:
 
+# RecallCards runs as app #4 on the shared gateway box (37.27.31.223), beside
+# 123resume, jsonsanitypro and spec-review. See my-simple-resume/SERVER-HANDOFF.md.
+# This deploy touches ONLY the recallcards-backend container: never the gateway,
+# never another project's containers, networks or volumes.
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Deploy to Server
+      - name: Deploy backend to server
         uses: appleboy/ssh-action@v1.0.3
         with:
-          host: 65.109.168.192
-          username: work
+          host: 37.27.31.223
+          username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            set -e  # Exit on error
+            set -euo pipefail
 
-            # Navigate to backend directory
-            BACKEND_DIR=~/website/flashcard-backend
-            if [ ! -d "$BACKEND_DIR" ]; then
-              echo "Error: Backend directory not found at $BACKEND_DIR"
-              exit 1
-            fi
+            APP=/root/recallcards/flashcard-backend
+            cd "$APP"
 
-            cd "$BACKEND_DIR"
-
-            # Fetch latest changes and reset to match remote exactly
-            # This discards any local changes to match the repository
+            # Match the repo exactly. Never `git clean`: it would delete the
+            # untracked .env that holds the Mongo password and Auth0 config.
             git fetch origin
             git reset --hard origin/main || git reset --hard origin/master
 
-            # Ensure Docker network exists
-            docker network create web 2>/dev/null || true
+            # The app network should already exist; create it if somehow gone.
+            docker network inspect recallcards-net >/dev/null 2>&1 || docker network create recallcards-net
 
-            # Rebuild backend service
-            docker compose build --no-cache backend
+            # Rebuild and restart ONLY the backend. --no-deps leaves the running
+            # MongoDB (and its data) and the frontend untouched.
+            docker compose -f docker-compose.prod.yml up -d --build --no-deps backend
 
-            # Stop old container and start new one
-            docker compose up -d --force-recreate backend
+            # The backend's container IP changes on recreate, and the frontend's
+            # nginx caches it. Reload the frontend so /api/ re-resolves the new IP.
+            # (Our own container; the shared gateway re-resolves on its own.)
+            docker exec recallcards-frontend nginx -s reload 2>/dev/null || true
 
-            # Verify container is running
-            docker compose ps backend
+            # Health gate: a crash on startup (bad import, lost Mongo) exits the
+            # container, so "still running after a moment" is the signal.
+            sleep 8
+            docker compose -f docker-compose.prod.yml ps backend
+            if [ "$(docker inspect -f '{{.State.Running}}' recallcards-backend)" != "true" ]; then
+              echo "::error::recallcards-backend is not running after deploy"
+              docker logs --tail 50 recallcards-backend || true
+              exit 1
+            fi
+            docker logs --tail 15 recallcards-backend || true
 
-            # Show logs if there are any issues
-            docker compose logs --tail=20 backend
+            # Best-effort end-to-end check through the gateway (non-fatal: the
+            # container-running gate above is the hard one).
+            code=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 8 https://recallcards.net/api/public/decks || true)
+            echo "api /api/public/decks -> ${code:-no-response}"
 
-            echo "Backend deployment completed successfully!"
+            # Reclaim only this project's dangling images.
+            docker image prune -f \
+              --filter "label=com.docker.compose.project=flashcard-backend" \
+              --filter "until=24h" || true
+
+            echo "Backend deploy OK"
