@@ -1,0 +1,15 @@
+# Used instead of .dockerignore when building Dockerfile.connector. The
+# shared .dockerignore excludes connector/ (to keep it out of the backend
+# image), which left this build with nothing to COPY.
+.git
+.github
+.erf
+.idea
+__pycache__
+**/__pycache__
+*.pyc
+docker-compose*.yml
+test_*.py
+*.md
+.env
+.env.*
