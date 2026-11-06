@@ -78,7 +78,7 @@ services:
     networks:
       - recallcards-net
 
-  # The MCP connector for Claude. Its own Python 3.11 image (the backend is 3.9).
+  # The MCP connector for Claude. Its own Python 3.11 image, like the backend.
   # It calls the REST API over the network for all card data and touches Mongo
   # only for its own OAuth tokens. The gateway proxies /mcp and /connector/* here.
   connector:

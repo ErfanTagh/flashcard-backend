@@ -1,5 +1,7 @@
 # Use an official Python image
-FROM python:3.9
+# 3.11: the anthropic SDK (ai_generate.py) needs Python 3.10 or newer. On 3.9
+# pip could not resolve it and every image build failed.
+FROM python:3.11
 
 # Set the working directory inside the container
 WORKDIR /app
