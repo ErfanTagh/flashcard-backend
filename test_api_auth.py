@@ -44,8 +44,9 @@ main.app.add_url_rule('/api/_probe', 'probe_caller', auth.requires_auth(_record)
 
 # Readable without signing in, each for a stated reason.
 PUBLIC = {
-    # Share links, the public library and their pictures used to be readable
-    # signed out. They are members-only now: a visitor signs up first.
+    'get_share': 'a share link shows what it is (name, owner, count, cover) before anyone joins; the cards are for members',
+    'get_image': "a share link's cover picture loads for a signed-out visitor; nothing else does",
+    # The public library stays members-only.
     'handle_auth_error': 'an error handler, not a route',
     # Signing in is how a caller gets a token, so it cannot require one.
     'accounts.signup': 'creating an account',

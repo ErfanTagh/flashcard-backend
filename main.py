@@ -11,7 +11,7 @@ import secrets
 from flask_cors import cross_origin
 from pymongo import MongoClient
 # Identity comes from a verified Auth0 token, never from a request parameter.
-from auth import AuthError, caller_email, requires_auth
+from auth import AuthError, caller_email, optional_auth, requires_auth
 import ai_generate
 import accounts
 
@@ -1164,20 +1164,30 @@ def _follower_may_read_image(email, image_id, owner):
 
 @app.route('/api/images/<image_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
-@requires_auth
+@optional_auth
 def get_image(image_id):
     """Serve a stored picture.
 
     Scoped to the owner, matching how the rest of this API treats an email
     address as the key to an account's data. A signed-in viewer of someone
     else's shared deck is authorised through the share link (?share=).
-    Signed-out visitors see nothing: decks are for members only.
+    A signed-out visitor gets one picture only: the cover of the deck whose
+    link they hold, which the share page shows. Card pictures are for members.
     """
     if images is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
     email = caller_email()
     share_id = request.args.get('share')
+
+    if not email:
+        share = (shares_collection.find_one({'share_id': share_id})
+                 if share_id and shares_collection is not None else None)
+        owner_doc = (flashcards_collection.find_one({'user_email': share['owner_email']})
+                     if share and flashcards_collection is not None else None)
+        if not owner_doc or _cover_of(owner_doc, share['collection_name']) != image_id:
+            # 404 rather than 401: say nothing about pictures that exist.
+            return jsonify({"status": 404, "error": "Image not found"}), 404
 
     try:
         stored = images.get(ObjectId(image_id))
@@ -1879,11 +1889,15 @@ def unshare_collection(collection_name):
 
 @app.route('/api/shares/<share_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
-@requires_auth
+@optional_auth
 def get_share(share_id):
-    """What is behind a share link. Holding the link is the permission to see
-    the deck, but only for someone signed in: a visitor without an account is
-    sent to sign up first and sees nothing until they have."""
+    """What is behind a share link.
+
+    Anyone holding the link sees a summary -- the deck's name, who shared it,
+    how many cards, its cover -- so the page can say what they were sent. The
+    cards themselves are for members: a signed-out visitor gets none, and
+    signs up to add the deck. A broken token is still a 401 (optional_auth).
+    """
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
@@ -1941,7 +1955,8 @@ def get_share(share_id):
         'owner_name': _display_name_of(owner_doc) or share.get('owner_name'),
         'cover': _cover_of(owner_doc, share['collection_name']),
         'card_count': len(payload),
-        'cards': payload,
+        # Members only: a signed-out visitor gets the summary above, not this.
+        'cards': payload if viewer else [],
     }), mimetype='application/json')
 
 
