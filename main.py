@@ -1,5 +1,6 @@
 import os
 import json
+import re
 from flask import Flask, Response, request, jsonify
 from werkzeug.exceptions import HTTPException
 from bson.objectid import ObjectId
@@ -2314,8 +2315,66 @@ def _character_similarity(a, b):
     return 1 - _edit_distance(a, b) / longest
 
 
+_NUMBERING = re.compile(r"^\s*\(?\d+[).]\s*")
+_PARENTHESES = re.compile(r"\([^)]*\)")
+
+
+def _answer_candidates(definition):
+    """Every way a back can be answered: the whole of it, and each meaning in it.
+
+    A back often holds a meaning plus an example, or several numbered
+    meanings, one per line:
+
+        responsibility
+        Verantwortung uebernehmen = to take responsibility
+
+        1) tight: Die Zeit ist knapp.
+        2) brief: kurz und knapp
+
+    Typing just "responsibility" or "tight" is a right answer, but against the
+    whole back it scores far too low. So each line (numbering dropped) is a
+    candidate, as is the label before a colon, each comma-separated
+    alternative, and the translation after an "=" -- never the example on its
+    left, so copying the sample sentence back is not a meaning.
+    """
+    candidates = [definition]
+    for raw in definition.splitlines():
+        line = _NUMBERING.sub("", raw).strip()
+        if not line:
+            continue
+        # The meaning: the label before a colon ("tight: ..."), or the whole
+        # line -- unless the line is an example ("Satz = translation").
+        if ":" in line:
+            head = line.split(":", 1)[0]
+        elif "=" in line:
+            head = None
+        else:
+            head = line
+        if head:
+            candidates.append(head)
+            candidates.extend(part for part in head.split(",") if part.strip())
+        if "=" in line:
+            candidates.append(line.rsplit("=", 1)[1])
+    # A note in brackets -- "interface (tech)", "lever (lit. adjusting screw)"
+    # -- is a hint, not part of the answer.
+    candidates += [_PARENTHESES.sub(" ", c) for c in candidates if "(" in c]
+    return candidates
+
+
 def grade_answer(answer, definition):
-    """Score a typed answer. Returns (grade, similarity)."""
+    """Score a typed answer against the whole back and each meaning in it.
+    Returns (grade, similarity) for the best match."""
+    best = ("incorrect", 0.0)
+    rank = {"incorrect": 0, "close": 1, "correct": 2}
+    for candidate in _answer_candidates(definition or ""):
+        result = _grade_against(answer, candidate)
+        if (rank[result[0]], result[1]) > (rank[best[0]], best[1]):
+            best = result
+    return best
+
+
+def _grade_against(answer, definition):
+    """Score a typed answer against one target. Returns (grade, similarity)."""
     a = _normalise_answer(answer or "")
     b = _normalise_answer(definition or "")
 
