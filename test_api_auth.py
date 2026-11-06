@@ -46,7 +46,7 @@ main.app.add_url_rule('/api/_probe', 'probe_caller', auth.requires_auth(_record)
 PUBLIC = {
     'get_share': 'a share link shows what it is (name, owner, count, cover) before anyone joins; the cards are for members',
     'get_image': "a share link's cover picture loads for a signed-out visitor; nothing else does",
-    # The public library stays members-only.
+    'list_public_decks': 'Explore is open to visitors: publishing a deck makes it readable by anyone',
     'handle_auth_error': 'an error handler, not a route',
     # Signing in is how a caller gets a token, so it cannot require one.
     'accounts.signup': 'creating an account',

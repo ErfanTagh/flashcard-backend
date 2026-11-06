@@ -1171,8 +1171,9 @@ def get_image(image_id):
     Scoped to the owner, matching how the rest of this API treats an email
     address as the key to an account's data. A signed-in viewer of someone
     else's shared deck is authorised through the share link (?share=).
-    A signed-out visitor gets one picture only: the cover of the deck whose
-    link they hold, which the share page shows. Card pictures are for members.
+    A signed-out visitor gets the cover of the deck whose link they hold,
+    and -- when that deck is published to Explore -- its card pictures too.
+    Nothing else.
     """
     if images is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
@@ -1185,7 +1186,14 @@ def get_image(image_id):
                  if share_id and shares_collection is not None else None)
         owner_doc = (flashcards_collection.find_one({'user_email': share['owner_email']})
                      if share and flashcards_collection is not None else None)
-        if not owner_doc or _cover_of(owner_doc, share['collection_name']) != image_id:
+        allowed = False
+        if owner_doc:
+            if _cover_of(owner_doc, share['collection_name']) == image_id:
+                allowed = True
+            elif share.get('public'):
+                deck = migrate_user_to_collections(owner_doc).get(share['collection_name']) or {}
+                allowed = any(_normalise_card(v).get('image') == image_id for v in deck.values())
+        if not allowed:
             # 404 rather than 401: say nothing about pictures that exist.
             return jsonify({"status": 404, "error": "Image not found"}), 404
 
@@ -1776,9 +1784,10 @@ def publish_collection(collection_name):
 
 @app.route('/api/public/decks', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
-@requires_auth
+@optional_auth
 def list_public_decks():
-    """Every deck anyone has published. Members only, like every deck view.
+    """Every deck anyone has published. Open to visitors without an account:
+    publishing a deck is what makes it readable by anyone.
 
     A viewer that says who it is gets told which ones it already has, so the
     library can show those as settled rather than offering them again.
@@ -1895,8 +1904,9 @@ def get_share(share_id):
 
     Anyone holding the link sees a summary -- the deck's name, who shared it,
     how many cards, its cover -- so the page can say what they were sent. The
-    cards themselves are for members: a signed-out visitor gets none, and
-    signs up to add the deck. A broken token is still a 401 (optional_auth).
+    cards themselves are for members, with one exception: a deck published to
+    Explore is readable by anyone, so a signed-out visitor can flip through it.
+    A broken token is still a 401 (optional_auth).
     """
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
@@ -1955,8 +1965,9 @@ def get_share(share_id):
         'owner_name': _display_name_of(owner_doc) or share.get('owner_name'),
         'cover': _cover_of(owner_doc, share['collection_name']),
         'card_count': len(payload),
-        # Members only: a signed-out visitor gets the summary above, not this.
-        'cards': payload if viewer else [],
+        # Members, or anyone for a published deck; otherwise just the summary.
+        'cards': payload if (viewer or share.get('public')) else [],
+        'public': bool(share.get('public')),
     }), mimetype='application/json')
 
 

@@ -1,7 +1,8 @@
 """What a share link shows to someone without an account.
 
 A signed-out visitor sees a summary -- name, owner, card count, cover -- and
-none of the cards. Of the deck's pictures, only the cover loads for them.
+none of the cards, unless the deck is published to Explore: then they can read
+(only read) its cards and pictures.
 
 Needs mongomock. Run with: python -m unittest test_share_preview
 """
@@ -90,8 +91,45 @@ class SharePreviewTestCase(unittest.TestCase):
         card = self.client.get(f'/api/images/{self.card_image_id}?share={SHARE_ID}', headers=self.auth(VIEWER))
         self.assertEqual(card.status_code, 200)
 
-    def test_public_library_stays_members_only(self):
-        self.assertEqual(self.client.get('/api/public/decks').status_code, 401)
+    # Published to Explore: readable by anyone, read-only.
+    def publish(self):
+        main.shares_collection.update_one({'share_id': SHARE_ID}, {'$set': {'public': True}})
+
+    def test_published_deck_shows_its_cards_signed_out(self):
+        self.publish()
+        body = self.client.get(f'/api/shares/{SHARE_ID}').get_json()
+        self.assertTrue(body['public'])
+        self.assertEqual({c['term'] for c in body['cards']}, {'die Stelle', 'leiten'})
+        self.assertNotIn('seen', body['cards'][0])  # the owner's progress is never shared
+
+    def test_unpublished_link_still_hides_cards(self):
+        body = self.client.get(f'/api/shares/{SHARE_ID}').get_json()
+        self.assertFalse(body['public'])
+        self.assertEqual(body['cards'], [])
+
+    def test_published_deck_card_pictures_load_signed_out(self):
+        self.publish()
+        card = self.client.get(f'/api/images/{self.card_image_id}?share={SHARE_ID}')
+        self.assertEqual(card.status_code, 200)
+        self.assertEqual(card.data, b'card-bytes')
+
+    def test_other_pictures_stay_private_even_for_a_published_deck(self):
+        self.publish()
+        stranger = str(main.images.put(b'other', content_type='image/png', metadata={'user_email': OWNER}))
+        self.assertEqual(self.client.get(f'/api/images/{stranger}?share={SHARE_ID}').status_code, 404)
+
+    def test_public_library_lists_published_decks_signed_out(self):
+        main.flashcards_collection.update_one({'user_email': OWNER}, {'$set': {
+            'collections.German.extra': main._default_card('third card')}})
+        self.publish()
+        response = self.client.get('/api/public/decks')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([d['collection'] for d in response.get_json()['decks']], ['German'])
+
+    def test_signed_out_cannot_follow_or_edit(self):
+        self.publish()
+        self.assertEqual(self.client.post(f'/api/shares/{SHARE_ID}/follow', json={}).status_code, 401)
+        self.assertEqual(self.client.post(f'/api/shares/{SHARE_ID}/cards', json={'word': 'x', 'ans': 'y'}).status_code, 401)
 
 
 if __name__ == '__main__':
