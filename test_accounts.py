@@ -223,6 +223,21 @@ class AccountsTestCase(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+    # where to go after activating
+    def test_activation_link_carries_a_safe_return_path(self):
+        self.signup(next='/import/abc123')
+        self.assertIn('/verify-email?token=', self.sent[-1]['text'])
+        self.assertIn('&next=/import/abc123', self.sent[-1]['text'])
+
+    def test_unsafe_return_paths_are_dropped(self):
+        for bad in ('https://evil.example/x', '//evil.example', '/\\evil.example', 'import/x', '/x\n/y'):
+            self.sent.clear()
+            accounts.limiter.reset()
+            accounts.users.delete_many({})
+            self.signup(next=bad)
+            self.assertNotIn('next=', self.sent[-1]['text'], bad)
+
+
 class MailerTestCase(unittest.TestCase):
     def test_no_transport_refuses_in_production(self):
         saved = {k: os.environ.pop(k, None) for k in ('MAILGUN_API_KEY', 'MAILGUN_DOMAIN', 'SMTP_HOST')}

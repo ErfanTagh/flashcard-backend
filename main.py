@@ -11,7 +11,7 @@ import secrets
 from flask_cors import cross_origin
 from pymongo import MongoClient
 # Identity comes from a verified Auth0 token, never from a request parameter.
-from auth import AuthError, caller_email, optional_auth, requires_auth
+from auth import AuthError, caller_email, requires_auth
 import ai_generate
 import accounts
 
@@ -1159,20 +1159,20 @@ def _follower_may_read_image(email, image_id, owner):
 
 @app.route('/api/images/<image_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
-@optional_auth
+@requires_auth
 def get_image(image_id):
     """Serve a stored picture.
 
     Scoped to the owner, matching how the rest of this API treats an email
-    address as the key to an account's data.
+    address as the key to an account's data. A signed-in viewer of someone
+    else's shared deck is authorised through the share link (?share=).
+    Signed-out visitors see nothing: decks are for members only.
     """
     if images is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 
     email = caller_email()
     share_id = request.args.get('share')
-    if not email and not share_id:
-        return jsonify({"status": 401, "error": "Sign in, or come through a share link"}), 401
 
     try:
         stored = images.get(ObjectId(image_id))
@@ -1761,9 +1761,9 @@ def publish_collection(collection_name):
 
 @app.route('/api/public/decks', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
-@optional_auth
+@requires_auth
 def list_public_decks():
-    """Every deck anyone has published.
+    """Every deck anyone has published. Members only, like every deck view.
 
     A viewer that says who it is gets told which ones it already has, so the
     library can show those as settled rather than offering them again.
@@ -1874,10 +1874,11 @@ def unshare_collection(collection_name):
 
 @app.route('/api/shares/<share_id>', methods=['GET'])
 @cross_origin(headers=["Content-Type", "Authorization"])
-@optional_auth
+@requires_auth
 def get_share(share_id):
-    """What is behind a share link. Deliberately open: holding the link is the
-    permission, and a recipient has to see what they are importing first."""
+    """What is behind a share link. Holding the link is the permission to see
+    the deck, but only for someone signed in: a visitor without an account is
+    sent to sign up first and sees nothing until they have."""
     if flashcards_collection is None or shares_collection is None:
         return jsonify({"status": 500, "error": "Database not connected"}), 500
 

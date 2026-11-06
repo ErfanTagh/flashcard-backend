@@ -143,8 +143,27 @@ def _app_url():
     return 'http://localhost:3001'
 
 
-def _link(path, token):
-    return f'{_app_url()}{path}?token={quote(token)}'
+def _safe_next(value):
+    """A path on this site to return to after signing in, or None.
+
+    Only same-site paths: anything that could leave the site (a scheme, a
+    protocol-relative //host, a backslash browsers treat as a slash) is
+    dropped, so a link cannot be used to bounce someone elsewhere.
+    """
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if (not value.startswith('/') or value.startswith('//') or '\\' in value
+            or len(value) > 300 or any(ord(c) < 32 for c in value)):
+        return None
+    return value
+
+
+def _link(path, token, next_path=None):
+    link = f'{_app_url()}{path}?token={quote(token)}'
+    if next_path:
+        link += f'&next={quote(next_path, safe="/")}'
+    return link
 
 
 def _public_user(doc):
@@ -232,14 +251,18 @@ def _issue_session(user_doc):
     }
 
 
-def _send_verification(user_doc):
-    """Give the account a fresh link and email it. Raises mailer.MailError."""
+def _send_verification(user_doc, next_path=None):
+    """Give the account a fresh link and email it. Raises mailer.MailError.
+
+    `next_path` rides along in the link, so whoever signed up from a share
+    link lands on that deck even when they open the email on another device.
+    """
     token = secrets.token_urlsafe(32)
     users.update_one({'_id': user_doc['_id']}, {'$set': {
         'verify_token_hash': _hash_token(token),
         'verify_expires': _now() + timedelta(hours=VERIFY_TTL_HOURS),
     }})
-    mailer.send_verification(user_doc['email'], _link('/verify-email', token), VERIFY_TTL_HOURS)
+    mailer.send_verification(user_doc['email'], _link('/verify-email', token, next_path), VERIFY_TTL_HOURS)
 
 
 CHECK_EMAIL = 'Check your inbox for a link to activate your account.'
@@ -298,7 +321,7 @@ def signup():
             user_doc = users.find_one({'email': email})
 
     try:
-        _send_verification(user_doc)
+        _send_verification(user_doc, _safe_next(data.get('next')))
     except mailer.MailError as exc:
         logger.error('verification mail to %s failed: %s', email, exc)
         return _error(502, MAIL_FAILED, 'mail_failed')
@@ -333,7 +356,8 @@ def resend_verification():
     if not _db_ready():
         return _error(500, 'Database not connected')
 
-    email = _email(_body().get('email'))
+    data = _body()
+    email = _email(data.get('email'))
     if not email:
         return _error(400, 'Enter a valid email address.', 'invalid_email')
     if _limited((f'resend:ip:{_client_ip()}', 10, 3600), (f'resend:email:{email}', 3, 3600)):
@@ -342,7 +366,7 @@ def resend_verification():
     user_doc = users.find_one({'email': email})
     if user_doc and not user_doc.get('verified'):
         try:
-            _send_verification(user_doc)
+            _send_verification(user_doc, _safe_next(data.get('next')))
         except mailer.MailError as exc:
             logger.error('verification resend to %s failed: %s', email, exc)
             return _error(502, MAIL_FAILED, 'mail_failed')
@@ -475,3 +499,4 @@ def me():
     if not user_doc:
         return _error(401, 'Your account no longer exists.', 'unknown_user')
     return jsonify({'status': 200, 'user': _public_user(user_doc)})
+
