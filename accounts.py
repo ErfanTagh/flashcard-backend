@@ -27,7 +27,9 @@ database is not a way into anyone's account.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import json
 import logging
 import os
 import re
@@ -36,9 +38,12 @@ import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+import urllib.error
+import urllib.parse
+import urllib.request
 from urllib.parse import quote
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, redirect, request
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from werkzeug.security import check_password_hash, generate_password_hash
@@ -61,6 +66,8 @@ EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
 
 users = None
 sessions = None
+oauth_states = None  # Google sign-in in flight: state -> PKCE verifier, return path
+oauth_codes = None   # one-time codes the website swaps for a session
 
 # Compared against when no account matches, so a missing account takes as
 # long to refuse as a wrong password and the timing gives nothing away.
@@ -72,9 +79,11 @@ def init(db, background=True):
 
     Index creation waits for the server, so by default it runs off the import
     path: the API starts even while MongoDB is still coming up."""
-    global users, sessions
+    global users, sessions, oauth_states, oauth_codes
     users = db.users
     sessions = db.auth_sessions
+    oauth_states = db.auth_oauth_states
+    oauth_codes = db.auth_oauth_codes
 
     def ensure_indexes():
         try:
@@ -84,6 +93,11 @@ def init(db, background=True):
             sessions.create_index('token_hash', unique=True)
             sessions.create_index('email')
             sessions.create_index('expires_at', expireAfterSeconds=0)
+            users.create_index('google_sub', sparse=True)
+            oauth_states.create_index('state_hash', unique=True)
+            oauth_states.create_index('expires_at', expireAfterSeconds=0)
+            oauth_codes.create_index('code_hash', unique=True)
+            oauth_codes.create_index('expires_at', expireAfterSeconds=0)
         except Exception as exc:  # the API still serves cards without them
             logger.error('could not create account indexes: %s', exc)
 
@@ -500,3 +514,212 @@ def me():
         return _error(401, 'Your account no longer exists.', 'unknown_user')
     return jsonify({'status': 200, 'user': _public_user(user_doc)})
 
+
+# --- Sign in with Google ----------------------------------------------------
+#
+#   GET  /api/auth/providers        -> {"google": true} when it is configured
+#   GET  /api/auth/google/start     -> 302 to Google (state + PKCE)
+#   GET  /api/auth/google/callback  -> Google returns here; we exchange the code
+#                                      server to server, then 302 to the site's
+#                                      /auth/callback with a one-time code
+#   POST /api/auth/google/exchange  -> that code, once, for a normal session
+#
+# The session never travels in a URL: the browser only ever sees a code that
+# works once, within two minutes. `state` is also set as a cookie scoped to
+# these routes, so a callback started in someone else's browser is refused
+# (login CSRF). Google has verified the address, so a new account is active
+# straight away, and an existing password account with the same address is
+# simply signed in -- Google has proven the address is theirs.
+#
+# Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET to switch it on. Register the
+# redirect URI {APP_URL}/api/auth/google/callback in the Google Cloud console.
+
+GOOGLE_AUTHORIZE_URL = 'https://accounts.google.com/o/oauth2/v2/auth'
+GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token'
+GOOGLE_ISSUERS = ('accounts.google.com', 'https://accounts.google.com')
+OAUTH_STATE_TTL = timedelta(minutes=10)
+OAUTH_CODE_TTL = timedelta(minutes=2)
+OAUTH_COOKIE = 'rc_google_state'
+
+
+def _google_config():
+    client_id = os.environ.get('GOOGLE_CLIENT_ID', '').strip()
+    secret = os.environ.get('GOOGLE_CLIENT_SECRET', '').strip()
+    return (client_id, secret) if client_id and secret else (None, None)
+
+
+def _google_redirect_uri():
+    return f'{_app_url()}/api/auth/google/callback'
+
+
+def _site_redirect(path, **params):
+    query = urllib.parse.urlencode({k: v for k, v in params.items() if v})
+    return redirect(f'{_app_url()}{path}' + (f'?{query}' if query else ''), code=302)
+
+
+def _google_failed(reason):
+    logger.warning('google sign-in failed: %s', reason)
+    response = _site_redirect('/login', error='google')
+    response.delete_cookie(OAUTH_COOKIE, path='/api/auth/google')
+    return response
+
+
+def _exchange_google_code(code, verifier):
+    """Swap Google's code for its tokens. Server to server, over TLS."""
+    client_id, secret = _google_config()
+    body = urllib.parse.urlencode({
+        'code': code,
+        'client_id': client_id,
+        'client_secret': secret,
+        'redirect_uri': _google_redirect_uri(),
+        'grant_type': 'authorization_code',
+        'code_verifier': verifier,
+    }).encode('ascii')
+    req = urllib.request.Request(GOOGLE_TOKEN_URL, data=body, headers={
+        'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/json'})
+    with urllib.request.urlopen(req, timeout=10) as response:
+        return json.loads(response.read())
+
+
+def _id_token_claims(id_token):
+    """The claims of an ID token received straight from Google's token
+    endpoint. Its signature is not re-checked: it came from Google over TLS in
+    a request we made, not through the browser (OpenID Connect Core 3.1.3.7).
+    Audience, issuer and expiry still are."""
+    try:
+        payload = id_token.split('.')[1]
+        payload += '=' * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:
+        return None
+    client_id, _ = _google_config()
+    if claims.get('aud') != client_id or claims.get('iss') not in GOOGLE_ISSUERS:
+        return None
+    if float(claims.get('exp', 0)) < time.time():
+        return None
+    return claims
+
+
+@bp.route('/providers', methods=['GET'])
+def providers():
+    client_id, _ = _google_config()
+    return jsonify({'status': 200, 'google': bool(client_id)})
+
+
+@bp.route('/google/start', methods=['GET'])
+def google_start():
+    client_id, _ = _google_config()
+    if not client_id or not _db_ready():
+        return _site_redirect('/login', error='google_unavailable')
+    if _limited((f'google:ip:{_client_ip()}', 30, 600)):
+        return _site_redirect('/login', error='rate_limited')
+
+    state = secrets.token_urlsafe(32)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode('ascii')).digest()).decode('ascii').rstrip('=')
+    oauth_states.insert_one({
+        'state_hash': _hash_token(state),
+        'verifier': verifier,
+        'next': _safe_next(request.args.get('next')),
+        'expires_at': _now() + OAUTH_STATE_TTL,
+    })
+
+    params = {
+        'client_id': client_id,
+        'redirect_uri': _google_redirect_uri(),
+        'response_type': 'code',
+        'scope': 'openid email profile',
+        'state': state,
+        'code_challenge': challenge,
+        'code_challenge_method': 'S256',
+        'prompt': 'select_account',
+    }
+    response = redirect(f'{GOOGLE_AUTHORIZE_URL}?{urllib.parse.urlencode(params)}', code=302)
+    response.set_cookie(
+        OAUTH_COOKIE, state, max_age=int(OAUTH_STATE_TTL.total_seconds()),
+        path='/api/auth/google', httponly=True, samesite='Lax',
+        secure=_app_url().startswith('https://'),
+    )
+    return response
+
+
+@bp.route('/google/callback', methods=['GET'])
+def google_callback():
+    if request.args.get('error'):
+        # Usually the person pressed Cancel on Google's page.
+        return _site_redirect('/login', error='google_cancelled')
+    code, state = request.args.get('code'), request.args.get('state')
+    cookie_state = request.cookies.get(OAUTH_COOKIE)
+    if not code or not state or not _db_ready():
+        return _google_failed('missing code or state')
+    if not cookie_state or not secrets.compare_digest(cookie_state, state):
+        return _google_failed('state does not match this browser')
+
+    pending = oauth_states.find_one_and_delete(
+        {'state_hash': _hash_token(state), 'expires_at': {'$gt': _now()}})
+    if not pending:
+        return _google_failed('state unknown or expired')
+
+    try:
+        tokens = _exchange_google_code(code, pending['verifier'])
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        return _google_failed(f'token exchange: {exc}')
+    claims = _id_token_claims(tokens.get('id_token') or '')
+    if not claims:
+        return _google_failed('id token rejected')
+
+    email = _email(claims.get('email'))
+    if not email or claims.get('email_verified') not in (True, 'true'):
+        return _google_failed('no verified email')
+    sub = str(claims.get('sub') or '')
+    name = (claims.get('given_name') or claims.get('name') or '').strip()[:60]
+
+    user_doc = users.find_one({'email': email})
+    if user_doc and user_doc.get('google_sub') and user_doc['google_sub'] != sub:
+        return _google_failed('address is linked to a different Google account')
+    if user_doc:
+        update = {'verified': True, 'google_sub': sub}
+        if not user_doc.get('verified'):
+            update['verified_at'] = _now()
+        if not user_doc.get('name') and name:
+            update['name'] = name
+        users.update_one({'_id': user_doc['_id']}, {'$set': update,
+                          '$unset': {'verify_token_hash': '', 'verify_expires': ''}})
+    else:
+        try:
+            users.insert_one({
+                'email': email, 'password_hash': None, 'verified': True,
+                'verified_at': _now(), 'name': name or None, 'google_sub': sub,
+                'created_at': _now(),
+            })
+        except DuplicateKeyError:
+            pass  # two tabs raced; the other one created it
+
+    login_code = secrets.token_urlsafe(32)
+    oauth_codes.insert_one({
+        'code_hash': _hash_token(login_code),
+        'email': email,
+        'expires_at': _now() + OAUTH_CODE_TTL,
+    })
+    logger.info('google sign-in: %s', email)
+    response = _site_redirect('/auth/callback', code=login_code, next=pending.get('next'))
+    response.delete_cookie(OAUTH_COOKIE, path='/api/auth/google')
+    return response
+
+
+@bp.route('/google/exchange', methods=['POST'])
+def google_exchange():
+    if not _db_ready():
+        return _error(500, 'Database not connected')
+    if _limited((f'google-exchange:ip:{_client_ip()}', 30, 600)):
+        return _error(429, TOO_MANY, 'rate_limited')
+    code = _body().get('code')
+    if not isinstance(code, str) or not code:
+        return _error(400, 'This sign-in link is incomplete.', 'invalid_code')
+    entry = oauth_codes.find_one_and_delete({'code_hash': _hash_token(code), 'expires_at': {'$gt': _now()}})
+    if not entry:
+        return _error(400, 'This sign-in has expired. Try again.', 'invalid_code')
+    user_doc = users.find_one({'email': entry['email']})
+    if not user_doc:
+        return _error(400, 'This sign-in has expired. Try again.', 'invalid_code')
+    return jsonify(_issue_session(user_doc))

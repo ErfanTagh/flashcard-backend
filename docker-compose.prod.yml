@@ -50,6 +50,12 @@ services:
       - MAILGUN_DOMAIN=${MAILGUN_DOMAIN:?set MAILGUN_DOMAIN in .env}
       - MAILGUN_API_BASE=${MAILGUN_API_BASE:-https://api.mailgun.net}
       - MAIL_FROM=${MAIL_FROM:-RecallCards <no-reply@recallcards.net>}
+      # "Continue with Google" (accounts.py). Optional: the button only
+      # appears once both are set. Create an OAuth client (Web application) in
+      # the Google Cloud console with this authorised redirect URI:
+      #   https://recallcards.net/api/auth/google/callback
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
       # Production. This alone makes the dev-auth bypass refuse to run even if
       # the next line were ever added by mistake.
       - FLASK_ENV=production

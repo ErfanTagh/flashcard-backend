@@ -29,6 +29,11 @@ services:
             # JWT_SECRET unset means a random key per start (sessions end on
             # restart), which is fine locally.
             - APP_URL=${APP_URL:-http://localhost:3001}
+            # Optional "Continue with Google" locally. The Google OAuth client
+            # needs http://localhost:3010/api/auth/google/callback (the port
+            # docker-compose.local.yml publishes) as an authorised redirect URI.
+            - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+            - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
             # Still honoured for scripts like share-scenarios.sh that name a
             # user with X-Dev-User; refused outright when FLASK_ENV says
             # production. It must never be set on the server.

@@ -238,6 +238,129 @@ class AccountsTestCase(unittest.TestCase):
             self.assertNotIn('next=', self.sent[-1]['text'], bad)
 
 
+class GoogleSignInTestCase(unittest.TestCase):
+    CLIENT_ID = 'test-client.apps.googleusercontent.com'
+
+    def setUp(self):
+        os.environ['GOOGLE_CLIENT_ID'] = self.CLIENT_ID
+        os.environ['GOOGLE_CLIENT_SECRET'] = 'test-secret'
+        db = mongomock.MongoClient().flashcards
+        accounts.init(db, background=False)
+        main.flashcards_collection = db.flashcards
+        main.shares_collection = db.shares
+        accounts.limiter.reset()
+        self.claims = {'iss': 'https://accounts.google.com', 'aud': self.CLIENT_ID,
+                       'exp': 4102444800, 'sub': 'google-123', 'email': 'G.User@Example.com',
+                       'email_verified': True, 'given_name': 'Gina'}
+        self.exchanged = []
+
+        def fake_exchange(code, verifier):
+            self.exchanged.append((code, verifier))
+            import base64, json as _json
+            body = base64.urlsafe_b64encode(_json.dumps(self.claims).encode()).decode().rstrip('=')
+            return {'id_token': f'header.{body}.signature'}
+
+        self._real_exchange = accounts._exchange_google_code
+        accounts._exchange_google_code = fake_exchange
+        self.client = main.app.test_client()
+
+    def tearDown(self):
+        accounts._exchange_google_code = self._real_exchange
+        os.environ.pop('GOOGLE_CLIENT_ID', None)
+        os.environ.pop('GOOGLE_CLIENT_SECRET', None)
+
+    def start(self, next_path='/import/abc'):
+        response = self.client.get('/api/auth/google/start', query_string={'next': next_path})
+        self.assertEqual(response.status_code, 302)
+        location = response.headers['Location']
+        self.assertTrue(location.startswith('https://accounts.google.com/'))
+        from urllib.parse import urlparse, parse_qs
+        params = {k: v[0] for k, v in parse_qs(urlparse(location).query).items()}
+        self.assertEqual(params['code_challenge_method'], 'S256')
+        return params['state']
+
+    def finish(self, state, cookie_state=None):
+        self.client.set_cookie('localhost', accounts.OAUTH_COOKIE, cookie_state or state, path='/api/auth/google')
+        return self.client.get('/api/auth/google/callback', query_string={'code': 'g-code', 'state': state})
+
+    def site_params(self, response):
+        from urllib.parse import urlparse, parse_qs
+        url = urlparse(response.headers['Location'])
+        return url.path, {k: v[0] for k, v in parse_qs(url.query).items()}
+
+    def test_providers_reports_google(self):
+        self.assertTrue(self.client.get('/api/auth/providers').get_json()['google'])
+        os.environ.pop('GOOGLE_CLIENT_ID')
+        self.assertFalse(self.client.get('/api/auth/providers').get_json()['google'])
+
+    def test_new_user_is_created_active_and_signed_in(self):
+        path, params = self.site_params(self.finish(self.start()))
+        self.assertEqual(path, '/auth/callback')
+        self.assertEqual(params['next'], '/import/abc')
+        session = self.client.post('/api/auth/google/exchange', json={'code': params['code']})
+        self.assertEqual(session.status_code, 200)
+        self.assertEqual(session.get_json()['user']['email'], 'g.user@example.com')
+        user = accounts.users.find_one({'email': 'g.user@example.com'})
+        self.assertTrue(user['verified'])
+        self.assertEqual(user['name'], 'Gina')
+        self.assertIsNone(user['password_hash'])
+        # The code works once.
+        self.assertEqual(self.client.post('/api/auth/google/exchange', json={'code': params['code']}).status_code, 400)
+        # A Google-only account cannot be signed into with a password.
+        self.assertEqual(self.client.post('/api/auth/login', json={'email': 'g.user@example.com', 'password': 'anything at all'}).status_code, 401)
+
+    def test_existing_password_account_is_signed_in_and_activated(self):
+        accounts.users.insert_one({'email': 'g.user@example.com', 'password_hash': 'x', 'verified': False,
+                                   'created_at': accounts._now(), 'verify_token_hash': 'h'})
+        _, params = self.site_params(self.finish(self.start()))
+        self.assertEqual(self.client.post('/api/auth/google/exchange', json={'code': params['code']}).status_code, 200)
+        user = accounts.users.find_one({'email': 'g.user@example.com'})
+        self.assertTrue(user['verified'])
+        self.assertEqual(user['google_sub'], 'google-123')
+        self.assertNotIn('verify_token_hash', user)
+
+    def test_state_from_another_browser_is_refused(self):
+        state = self.start()
+        path, params = self.site_params(self.finish(state, cookie_state='someone-elses-state'))
+        self.assertEqual((path, params.get('error')), ('/login', 'google'))
+        self.assertEqual(self.exchanged, [])
+
+    def test_state_is_single_use(self):
+        state = self.start()
+        self.finish(state)
+        path, params = self.site_params(self.finish(state))
+        self.assertEqual((path, params.get('error')), ('/login', 'google'))
+
+    def test_unverified_google_email_is_refused(self):
+        self.claims['email_verified'] = False
+        path, params = self.site_params(self.finish(self.start()))
+        self.assertEqual((path, params.get('error')), ('/login', 'google'))
+        self.assertIsNone(accounts.users.find_one({'email': 'g.user@example.com'}))
+
+    def test_token_for_another_app_is_refused(self):
+        self.claims['aud'] = 'some-other-app'
+        path, params = self.site_params(self.finish(self.start()))
+        self.assertEqual((path, params.get('error')), ('/login', 'google'))
+
+    def test_address_linked_to_another_google_account_is_refused(self):
+        accounts.users.insert_one({'email': 'g.user@example.com', 'password_hash': None, 'verified': True,
+                                   'google_sub': 'google-999', 'created_at': accounts._now()})
+        path, params = self.site_params(self.finish(self.start()))
+        self.assertEqual((path, params.get('error')), ('/login', 'google'))
+
+    def test_cancel_on_google_goes_back_to_login(self):
+        response = self.client.get('/api/auth/google/callback', query_string={'error': 'access_denied'})
+        self.assertEqual(self.site_params(response), ('/login', {'error': 'google_cancelled'}))
+
+    def test_unsafe_next_is_not_carried(self):
+        _, params = self.site_params(self.finish(self.start(next_path='https://evil.example')))
+        self.assertNotIn('next', params)
+
+    def test_start_without_configuration_says_so(self):
+        os.environ.pop('GOOGLE_CLIENT_ID')
+        response = self.client.get('/api/auth/google/start')
+        self.assertEqual(self.site_params(response), ('/login', {'error': 'google_unavailable'}))
+
 class MailerTestCase(unittest.TestCase):
     def test_no_transport_refuses_in_production(self):
         saved = {k: os.environ.pop(k, None) for k in ('MAILGUN_API_KEY', 'MAILGUN_DOMAIN', 'SMTP_HOST')}

@@ -57,6 +57,10 @@ PUBLIC = {
     'accounts.logout': 'revoking a refresh token',
     'accounts.forgot_password': 'asking for a password reset link',
     'accounts.reset_password': 'following the emailed reset link',
+    'accounts.providers': 'which sign-in buttons the sign-in page shows',
+    'accounts.google_start': 'sending the browser to Google to sign in',
+    'accounts.google_callback': 'Google sending the browser back',
+    'accounts.google_exchange': 'swapping the one-time Google code for a session',
 }
 
 # Of those, the ones that never read a bearer token at all.
