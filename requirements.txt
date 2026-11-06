@@ -22,3 +22,9 @@ six==1.16.0
 Werkzeug==2.2.2
 wrapt==1.14.1
 zipp==3.8.1
+# AI deck generation from documents/images (ai_generate.py).
+anthropic>=2.6.0,<3
+# Reading HEIC/HEIF phone photos (optional at runtime: ai_generate falls back
+# to a clear "export as JPEG" message if these are unavailable).
+Pillow>=10.0,<12
+pillow-heif>=0.13,<1

@@ -29,6 +29,10 @@ services:
             # refuses to honour it at all when FLASK_ENV says production. It
             # must never be set on the server.
             - RECALLCARDS_DEV_AUTH=true
+            # AI deck generation (/api/generate-cards). Export ANTHROPIC_API_KEY
+            # in your shell before `docker compose up` to try it locally; left
+            # unset, the feature just reports it isn't configured.
+            - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
         depends_on:
             - mongodb
         networks:

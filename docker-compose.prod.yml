@@ -45,6 +45,10 @@ services:
       - FLASK_ENV=production
       # RECALLCARDS_DEV_AUTH is deliberately ABSENT. Setting it here reopens the
       # authentication hole the app was just fixed for. Never add it on a server.
+      # AI deck generation (/api/generate-cards). Set ANTHROPIC_API_KEY in .env
+      # on the box; without it the feature returns a clear "not configured"
+      # message and the rest of the app is unaffected.
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
     depends_on:
       - mongodb
     networks:

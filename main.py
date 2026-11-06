@@ -12,6 +12,7 @@ from flask_cors import cross_origin
 from pymongo import MongoClient
 # Identity comes from a verified Auth0 token, never from a request parameter.
 from auth import AuthError, caller_email, optional_auth, requires_auth
+import ai_generate
 
 app = Flask(__name__)
 
@@ -1024,8 +1025,11 @@ ALLOWED_IMAGE_TYPES = {
 }
 
 # Flask rejects a larger body before the view runs, which turns a huge upload
-# into a cheap 413 instead of buffering it.
-app.config["MAX_CONTENT_LENGTH"] = MAX_IMAGE_BYTES + (256 * 1024)
+# into a cheap 413 instead of buffering it. Sized for the largest document the
+# AI-generation endpoint accepts (several files, a PDF among them) -- the image
+# endpoint still enforces its own 5MB limit in code, so raising this here does
+# not loosen the limit on a card picture.
+app.config["MAX_CONTENT_LENGTH"] = ai_generate.MAX_TOTAL_BYTES + (2 * 1024 * 1024)
 
 
 def _delete_image(image_id):
@@ -1071,9 +1075,12 @@ def _card_image_ids(cards):
 
 @app.errorhandler(413)
 def handle_too_large(error):
+    # Reached only when the body exceeds the app-wide limit. The image and
+    # generation endpoints give their own, more specific messages below the
+    # smaller per-feature limits they enforce in code.
     return jsonify({
         "status": 413,
-        "error": f"Image is too large. The limit is {MAX_IMAGE_BYTES // (1024 * 1024)}MB.",
+        "error": "That upload is too large.",
     }), 413
 
 
@@ -1333,6 +1340,53 @@ def import_deck_json():
         'collection': name,
         'imported': len(cards),
         'warnings': warnings,
+    }), mimetype='application/json')
+
+
+# Generating a deck from documents with Claude
+#
+# The user uploads documents or images and the model reads them into cards.
+# This endpoint only generates: it returns the cards for the user to look over
+# and does not touch the database. Saving goes through the import path above,
+# once the user has seen what they are getting -- so a generation they do not
+# like writes nothing, and the one place that validates and stores a deck stays
+# the one place that validates and stores a deck.
+
+
+@app.route('/api/generate-cards', methods=['POST'])
+@cross_origin(headers=["Content-Type", "Authorization"])
+@requires_auth
+def generate_cards_route():
+    """Generate a deck from uploaded documents or images, for review."""
+    uploads = request.files.getlist('files')
+    files = []
+    for upload in uploads:
+        if not upload:
+            continue
+        files.append((
+            upload.filename or "file",
+            (upload.mimetype or "").lower(),
+            upload.read(),
+        ))
+
+    user_prompt = request.form.get('prompt', '')
+    count = request.form.get('count')
+
+    try:
+        result = ai_generate.generate_cards(files, user_prompt=user_prompt, count=count)
+    except ai_generate.GenerationError as error:
+        return jsonify({"status": 400, "error": str(error)}), 400
+    except Exception:
+        # A genuine fault -- a bug here, the model service down -- not something
+        # the user phrased wrong. Log it; tell them only that it failed.
+        app.logger.exception("card generation failed")
+        return jsonify({"status": 500, "error": "Generation failed. Please try again."}), 500
+
+    return Response(json.dumps({
+        "status": 200,
+        "name": result["name"],
+        "cards": result["cards"],
+        "count": len(result["cards"]),
     }), mimetype='application/json')
 
 
