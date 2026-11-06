@@ -214,6 +214,11 @@ def _attribute(cards, owner_email, viewer_email):
 # now live in auth.py.
 @app.errorhandler(AuthError)
 def handle_auth_error(ex):
+    # Why a caller was refused (expired, invalid, missing...), so a report of
+    # "it says I'm not allowed" can be read straight off the log. No token or
+    # address is logged.
+    app.logger.warning('auth refused %s %s: %s', request.method, request.path,
+                       ex.error.get('code', 'unknown'))
     response = jsonify(ex.error)
     response.status_code = ex.status_code
     return response
