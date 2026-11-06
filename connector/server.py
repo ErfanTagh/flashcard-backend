@@ -4,8 +4,8 @@ signed-in user manage their flashcards from Claude.
 
     python -m connector.server          # listens on :8100, MCP at /mcp
 
-Auth: OAuth 2.1 with Dynamic Client Registration. The login bounces through
-Auth0 (connector/login_pages.py); the token Claude receives carries the user's
+Auth: OAuth 2.1 with Dynamic Client Registration. The user signs in with their
+RecallCards account (connector/login_pages.py); the token Claude receives carries the user's
 email, and every tool calls the RecallCards REST API with that user's token, so
 the API does all authorization and scoping (connector/store.py).
 """
@@ -37,20 +37,12 @@ SITE_URL = os.getenv("CONNECTOR_SITE_URL", PUBLIC_URL).rstrip("/")
 SCOPE = "cards"
 RESOURCE = f"{PUBLIC_URL}/mcp"
 
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "dev-43bumhcy.us.auth0.com")
-AUTH0_AUDIENCE = os.getenv("CONNECTOR_AUTH0_AUDIENCE", "recallcards")
-CLIENT_ID = os.getenv("CONNECTOR_AUTH0_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("CONNECTOR_AUTH0_CLIENT_SECRET", "")
-
 oauth_provider = RecallcardsOAuthProvider(PUBLIC_URL, SCOPE)
 login_pages.configure(
     public_url=PUBLIC_URL,
     site_url=SITE_URL,
+    api_url=store.API_URL,
     oauth_provider=oauth_provider,
-    auth0_domain=AUTH0_DOMAIN,
-    auth0_audience=AUTH0_AUDIENCE,
-    client_id=CLIENT_ID,
-    client_secret=CLIENT_SECRET,
     ost=oauth_store,
 )
 
@@ -213,16 +205,16 @@ async def follow_deck(share_id: str) -> dict:
     return await _run(store.follow_deck, share_id)
 
 
-# --- login routes (the Auth0 round trip) ----------------------------------
+# --- login routes (a RecallCards sign-in form) ----------------------------
 
 @mcp.custom_route("/connector/login", methods=["GET"])
 async def route_login(request):
     return await login_pages.login_page(request)
 
 
-@mcp.custom_route("/connector/oauth/done", methods=["GET"])
-async def route_oauth_done(request):
-    return await login_pages.oauth_done(request)
+@mcp.custom_route("/connector/login", methods=["POST"])
+async def route_login_submit(request):
+    return await login_pages.login_submit(request)
 
 
 def app():

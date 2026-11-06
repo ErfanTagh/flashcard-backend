@@ -1,289 +1,182 @@
 """Tests for auth.py: what counts as proof of identity, and what does not.
 
-Run with: python -m pytest test_auth.py   (or: python test_auth.py)
+Run with: python -m unittest test_auth
 
-A real RSA key is generated here and a real token signed with it, so the
-signature check is exercised rather than mocked. Only the two network calls --
-Auth0's key set and /userinfo -- are stubbed.
+Real tokens are signed with the real key, so the signature check is exercised
+rather than mocked.
 """
-import base64
-import importlib
-import json
 import os
 import time
 import unittest
 
-from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwt
-from jose.utils import long_to_base64
-
-DOMAIN = 'test-tenant.auth0.com'
-AUDIENCE = 'recallcards'
-EMAIL_CLAIM = 'https://recallcards.net/email'
-
-os.environ['AUTH0_DOMAIN'] = DOMAIN
-os.environ['AUTH0_AUDIENCE'] = AUDIENCE
-os.environ['AUTH0_EMAIL_CLAIM'] = EMAIL_CLAIM
+os.environ['JWT_SECRET'] = 'test-secret-' + 'x' * 40
 os.environ.pop('RECALLCARDS_DEV_AUTH', None)
+os.environ.pop('FLASK_ENV', None)
 
 import auth  # noqa: E402  (imported after the environment is set)
 from flask import Flask  # noqa: E402
+from jose import jwt  # noqa: E402
+
+EMAIL = 'someone@example.com'
 
 
-def _rsa_jwk(private_key, kid):
-    numbers = private_key.public_key().public_numbers()
-    return {
-        'kty': 'RSA',
-        'kid': kid,
-        'use': 'sig',
-        'alg': 'RS256',
-        'n': long_to_base64(numbers.n).decode('ascii'),
-        'e': long_to_base64(numbers.e).decode('ascii'),
-    }
-
-
-PRIVATE_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-OTHER_KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-KID = 'test-key-1'
-
-
-def _pem(key):
-    from cryptography.hazmat.primitives import serialization
-    return key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode('ascii')
-
-
-def make_token(key=PRIVATE_KEY, kid=KID, audience=AUDIENCE, issuer=None,
-               expires_in=3600, claims=None):
+def forge(claims=None, secret=None, algorithm='HS256'):
     now = int(time.time())
-    payload = {
-        'sub': 'auth0|abc123',
-        'aud': audience,
-        'iss': issuer or f'https://{DOMAIN}/',
-        'iat': now,
-        'exp': now + expires_in,
-    }
-    payload.update(claims or {})
-    return jwt.encode(payload, _pem(key), algorithm='RS256', headers={'kid': kid})
+    base = {'sub': EMAIL, 'email': EMAIL, 'typ': 'access', 'iss': auth.ISSUER,
+            'aud': auth.AUDIENCE, 'iat': now, 'exp': now + 600}
+    base.update(claims or {})
+    base = {k: v for k, v in base.items() if v is not None}
+    return jwt.encode(base, secret or auth.JWT_SECRET, algorithm=algorithm)
 
 
-class AuthTestCase(unittest.TestCase):
+class VerifyTestCase(unittest.TestCase):
     def setUp(self):
-        importlib.reload(auth)
         self.app = Flask(__name__)
-        self.jwks_fetches = 0
-        self.userinfo_calls = 0
 
-        def fake_fetch_jwks():
-            self.jwks_fetches += 1
-            return {'keys': [_rsa_jwk(PRIVATE_KEY, KID)]}
-
-        auth._fetch_jwks = fake_fetch_jwks
-
-    def _resolve(self, headers=None, json_body=None, query=''):
-        with self.app.test_request_context(
-            f'/api/thing{query}', headers=headers or {}, json=json_body
-        ):
+    def caller(self, headers=None, **kwargs):
+        with self.app.test_request_context('/', headers=headers or {}, **kwargs):
             return auth.resolve_caller()
 
-    def _bearer(self, token):
-        return {'Authorization': f'Bearer {token}'}
+    def assertRefused(self, token, code=None):
+        with self.assertRaises(auth.AuthError) as ctx:
+            self.caller({'Authorization': f'Bearer {token}'})
+        self.assertEqual(ctx.exception.status_code, 401)
+        if code:
+            self.assertEqual(ctx.exception.error['code'], code)
 
-    # --- the happy path ---
+    def test_issued_token_identifies_its_owner(self):
+        token, ttl = auth.issue_access_token(EMAIL)
+        self.assertEqual(self.caller({'Authorization': f'Bearer {token}'}), EMAIL)
+        self.assertEqual(ttl, auth.ACCESS_TOKEN_TTL)
 
-    def test_email_from_custom_claim(self):
-        token = make_token(claims={EMAIL_CLAIM: 'Erfan@Example.com'})
-        self.assertEqual(self._resolve(self._bearer(token)), 'erfan@example.com')
-        self.assertEqual(self.userinfo_calls, 0, 'a claim should avoid the /userinfo call')
-
-    def test_email_from_standard_claim(self):
-        token = make_token(claims={'email': 'plain@example.com'})
-        self.assertEqual(self._resolve(self._bearer(token)), 'plain@example.com')
-
-    def test_email_from_userinfo_when_no_claim(self):
-        def fake_userinfo(token, claims):
-            self.userinfo_calls += 1
-            return 'viauserinfo@example.com'
-
-        auth._userinfo_email = fake_userinfo
-        token = make_token()
-        self.assertEqual(self._resolve(self._bearer(token)), 'viauserinfo@example.com')
-        self.assertEqual(self.userinfo_calls, 1)
-
-    # --- what must be refused ---
+    def test_address_is_normalised(self):
+        token = forge({'sub': ' Someone@Example.COM '})
+        self.assertEqual(self.caller({'Authorization': f'Bearer {token}'}), EMAIL)
 
     def test_no_header_is_not_a_caller(self):
-        self.assertIsNone(self._resolve())
+        self.assertIsNone(self.caller())
 
     def test_email_parameter_alone_proves_nothing(self):
-        """The whole point: naming an address must not identify you."""
-        self.assertIsNone(self._resolve(query='?email=victim@example.com'))
-        self.assertIsNone(self._resolve(json_body={'token': 'victim@example.com'}))
+        self.assertIsNone(self.caller(query_string={'email': EMAIL}))
+        self.assertIsNone(self.caller(json={'token': EMAIL, 'email': EMAIL}))
 
-    def test_token_signed_by_another_key_is_refused(self):
-        token = make_token(key=OTHER_KEY, claims={EMAIL_CLAIM: 'attacker@example.com'})
-        with self.assertRaises(auth.AuthError) as caught:
-            self._resolve(self._bearer(token))
-        self.assertEqual(caught.exception.status_code, 401)
+    def test_token_signed_with_another_key_is_refused(self):
+        self.assertRefused(forge(secret='another-secret-' + 'y' * 40), 'invalid_token')
 
     def test_tampered_payload_is_refused(self):
-        token = make_token(claims={EMAIL_CLAIM: 'real@example.com'})
-        header_b64, payload_b64, signature = token.split('.')
-        forged = json.loads(base64.urlsafe_b64decode(payload_b64 + '==='))
-        forged[EMAIL_CLAIM] = 'victim@example.com'
-        swapped = base64.urlsafe_b64encode(
-            json.dumps(forged).encode('utf-8')
-        ).decode('ascii').rstrip('=')
-        with self.assertRaises(auth.AuthError):
-            self._resolve(self._bearer(f'{header_b64}.{swapped}.{signature}'))
+        token = forge()
+        header, payload, signature = token.split('.')
+        other = forge({'sub': 'victim@example.com'}).split('.')[1]
+        self.assertRefused(f'{header}.{other}.{signature[::-1]}')
+        self.assertRefused(f'{header}.{other}.{signature}')
 
     def test_expired_token_is_refused(self):
-        token = make_token(expires_in=-10, claims={EMAIL_CLAIM: 'late@example.com'})
-        with self.assertRaises(auth.AuthError) as caught:
-            self._resolve(self._bearer(token))
-        self.assertEqual(caught.exception.error['code'], 'token_expired')
+        self.assertRefused(forge({'exp': int(time.time()) - 10}), 'token_expired')
 
     def test_token_for_another_audience_is_refused(self):
-        token = make_token(audience='some-other-api', claims={EMAIL_CLAIM: 'x@example.com'})
-        with self.assertRaises(auth.AuthError) as caught:
-            self._resolve(self._bearer(token))
-        self.assertEqual(caught.exception.error['code'], 'invalid_claims')
+        self.assertRefused(forge({'aud': 'something-else'}), 'invalid_claims')
 
     def test_token_from_another_issuer_is_refused(self):
-        token = make_token(issuer='https://evil.example.com/',
-                           claims={EMAIL_CLAIM: 'x@example.com'})
-        with self.assertRaises(auth.AuthError):
-            self._resolve(self._bearer(token))
+        self.assertRefused(forge({'iss': 'https://evil.example/'}), 'invalid_claims')
+
+    def test_token_of_another_type_is_refused(self):
+        self.assertRefused(forge({'typ': 'refresh'}), 'invalid_token')
+        self.assertRefused(forge({'typ': None}), 'invalid_token')
 
     def test_unsigned_token_is_refused(self):
-        """alg=none must never be accepted."""
+        import base64
+        import json
+
+        def b64(obj):
+            return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b'=').decode()
+
         now = int(time.time())
-        payload = {'sub': 'a', 'aud': AUDIENCE, 'iss': f'https://{DOMAIN}/',
-                   'exp': now + 600, EMAIL_CLAIM: 'none@example.com'}
-        encode = lambda d: base64.urlsafe_b64encode(
-            json.dumps(d).encode()).decode().rstrip('=')
-        unsigned = f"{encode({'alg': 'none', 'kid': KID})}.{encode(payload)}."
-        with self.assertRaises(auth.AuthError):
-            self._resolve(self._bearer(unsigned))
+        token = b64({'alg': 'none', 'typ': 'JWT'}) + '.' + b64({
+            'sub': EMAIL, 'typ': 'access', 'iss': auth.ISSUER, 'aud': auth.AUDIENCE,
+            'iat': now, 'exp': now + 600}) + '.'
+        self.assertRefused(token)
+
+    def test_other_algorithm_is_refused(self):
+        self.assertRefused(forge(algorithm='HS512'), 'invalid_header')
+
+    def test_token_without_subject_is_refused(self):
+        self.assertRefused(forge({'sub': None}))
 
     def test_malformed_header_is_refused(self):
-        for header in ({'Authorization': 'Bearer'},
-                       {'Authorization': 'Basic abc'},
-                       {'Authorization': 'Bearer a b'}):
-            with self.subTest(header=header), self.assertRaises(auth.AuthError):
-                self._resolve(header)
+        with self.assertRaises(auth.AuthError):
+            self.caller({'Authorization': 'Token abc'})
+        with self.assertRaises(auth.AuthError):
+            self.caller({'Authorization': 'Bearer'})
 
     def test_garbage_token_is_refused(self):
-        with self.assertRaises(auth.AuthError):
-            self._resolve(self._bearer('not-a-jwt'))
-
-    # --- the key set is not refetched per request ---
-
-    def test_jwks_is_cached(self):
-        token = make_token(claims={EMAIL_CLAIM: 'a@example.com'})
-        for _ in range(5):
-            self._resolve(self._bearer(token))
-        self.assertEqual(self.jwks_fetches, 1, 'the key set should be fetched once, not per request')
-
-    def test_unknown_kid_triggers_one_refresh(self):
-        token = make_token(kid='rotated-key')
-        with self.assertRaises(auth.AuthError):
-            self._resolve(self._bearer(token))
-        self.assertEqual(self.jwks_fetches, 2, 'an unknown kid should refresh the keys exactly once')
-
-    def test_stale_keys_are_served_when_auth0_is_unreachable(self):
-        token = make_token(claims={EMAIL_CLAIM: 'a@example.com'})
-        self._resolve(self._bearer(token))  # warm the cache
-
-        def exploding_fetch():
-            self.jwks_fetches += 1
-            raise OSError('auth0 unreachable')
-
-        auth._fetch_jwks = exploding_fetch
-        auth._jwks_fetched_at = 0  # force the TTL to look expired
-        self.assertEqual(self._resolve(self._bearer(token)), 'a@example.com')
-
-    def test_no_keys_and_no_cache_is_a_clean_401(self):
-        def exploding_fetch():
-            raise OSError('auth0 unreachable')
-
-        auth._fetch_jwks = exploding_fetch
-        token = make_token(claims={EMAIL_CLAIM: 'a@example.com'})
-        with self.assertRaises(auth.AuthError) as caught:
-            self._resolve(self._bearer(token))
-        self.assertEqual(caught.exception.error['code'], 'jwks_unavailable')
-
-    # --- the development bypass ---
+        self.assertRefused('not.a.token', 'invalid_header')
 
     def test_dev_bypass_is_off_unless_asked_for(self):
         self.assertFalse(auth.DEV_AUTH_BYPASS)
-        self.assertIsNone(self._resolve(query='?email=someone@example.com'))
+        self.assertIsNone(self.caller({'X-Dev-User': EMAIL}))
 
     def test_dev_bypass_names_a_user_when_switched_on(self):
-        os.environ['RECALLCARDS_DEV_AUTH'] = '1'
+        auth.DEV_AUTH_BYPASS = True
         try:
-            importlib.reload(auth)
-            self.assertTrue(auth.DEV_AUTH_BYPASS)
-            with self.app.test_request_context('/api/thing?email=Dev@Example.com'):
-                self.assertEqual(auth.resolve_caller(), 'dev@example.com')
+            self.assertEqual(self.caller({'X-Dev-User': EMAIL}), EMAIL)
         finally:
-            os.environ.pop('RECALLCARDS_DEV_AUTH', None)
-            importlib.reload(auth)
+            auth.DEV_AUTH_BYPASS = False
 
     def test_dev_bypass_refuses_to_work_in_production(self):
-        os.environ['RECALLCARDS_DEV_AUTH'] = '1'
+        auth.DEV_AUTH_BYPASS = True
         os.environ['FLASK_ENV'] = 'production'
         try:
-            importlib.reload(auth)
-            with self.app.test_request_context('/api/thing?email=someone@example.com'):
-                self.assertIsNone(auth.resolve_caller())
+            self.assertIsNone(self.caller({'X-Dev-User': EMAIL}))
         finally:
-            os.environ.pop('RECALLCARDS_DEV_AUTH', None)
+            auth.DEV_AUTH_BYPASS = False
             os.environ.pop('FLASK_ENV', None)
-            importlib.reload(auth)
 
-    # --- the decorators ---
+    def test_production_refuses_to_start_without_a_secret(self):
+        saved = os.environ.pop('JWT_SECRET')
+        os.environ['FLASK_ENV'] = 'production'
+        try:
+            with self.assertRaises(RuntimeError):
+                auth._load_secret()
+            os.environ['JWT_SECRET'] = 'short'
+            with self.assertRaises(RuntimeError):
+                auth._load_secret()
+        finally:
+            os.environ['JWT_SECRET'] = saved
+            os.environ.pop('FLASK_ENV', None)
 
-    def test_requires_auth_rejects_and_passes_through(self):
-        app = Flask(__name__)
 
-        @app.route('/guarded')
+class DecoratorTestCase(unittest.TestCase):
+    def setUp(self):
+        self.app = Flask(__name__)
+
+        @self.app.errorhandler(auth.AuthError)
+        def handle(ex):
+            return ex.error, ex.status_code
+
+        @self.app.route('/private')
         @auth.requires_auth
-        def guarded():
-            return {'you_are': auth.caller_email()}
+        def private():
+            return {'email': auth.caller_email()}
 
-        app.register_error_handler(
-            auth.AuthError, lambda e: (json.dumps(e.error), e.status_code)
-        )
-        client = app.test_client()
-        self.assertEqual(client.get('/guarded').status_code, 401)
-
-        token = make_token(claims={EMAIL_CLAIM: 'erfan@example.com'})
-        response = client.get('/guarded', headers=self._bearer(token))
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.get_json()['you_are'], 'erfan@example.com')
-
-    def test_optional_auth_allows_anonymous_but_rejects_a_bad_token(self):
-        app = Flask(__name__)
-
-        @app.route('/public')
+        @self.app.route('/public')
         @auth.optional_auth
         def public():
-            return {'you_are': auth.caller_email()}
+            return {'email': auth.caller_email()}
 
-        app.register_error_handler(
-            auth.AuthError, lambda e: (json.dumps(e.error), e.status_code)
-        )
-        client = app.test_client()
+        self.client = self.app.test_client()
+        self.token, _ = auth.issue_access_token(EMAIL)
 
-        anonymous = client.get('/public')
-        self.assertEqual(anonymous.status_code, 200)
-        self.assertIsNone(anonymous.get_json()['you_are'])
+    def test_requires_auth_rejects_and_passes_through(self):
+        self.assertEqual(self.client.get('/private').status_code, 401)
+        response = self.client.get('/private', headers={'Authorization': f'Bearer {self.token}'})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()['email'], EMAIL)
 
-        self.assertEqual(client.get('/public', headers=self._bearer('junk')).status_code, 401)
+    def test_optional_auth_allows_anonymous_but_rejects_a_bad_token(self):
+        self.assertEqual(self.client.get('/public').get_json()['email'], None)
+        self.assertEqual(self.client.get('/public', headers={'Authorization': 'Bearer junk'}).status_code, 401)
+        response = self.client.get('/public', headers={'Authorization': f'Bearer {self.token}'})
+        self.assertEqual(response.get_json()['email'], EMAIL)
 
 
 if __name__ == '__main__':

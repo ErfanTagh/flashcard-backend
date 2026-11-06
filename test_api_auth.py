@@ -11,21 +11,9 @@ it was let through.
 Run with: python test_api_auth.py
 """
 import os
-import time
 import unittest
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwt
-from jose.utils import long_to_base64
-
-DOMAIN = 'test-tenant.auth0.com'
-AUDIENCE = 'recallcards'
-EMAIL_CLAIM = 'https://recallcards.net/email'
-
-os.environ['AUTH0_DOMAIN'] = DOMAIN
-os.environ['AUTH0_AUDIENCE'] = AUDIENCE
-os.environ['AUTH0_EMAIL_CLAIM'] = EMAIL_CLAIM
+os.environ['JWT_SECRET'] = 'test-secret-' + 'x' * 40
 os.environ.pop('RECALLCARDS_DEV_AUTH', None)
 # Keep PyMongo from trying to reach a server during import.
 os.environ.setdefault('MONGO_HOST', 'localhost')
@@ -33,33 +21,25 @@ os.environ.setdefault('MONGO_HOST', 'localhost')
 import auth  # noqa: E402
 import main  # noqa: E402
 
-KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-KID = 'test-key-1'
 VICTIM = 'victim@example.com'
 CALLER = 'caller@example.com'
 
 
-def _jwks():
-    numbers = KEY.public_key().public_numbers()
-    return {'keys': [{
-        'kty': 'RSA', 'kid': KID, 'use': 'sig', 'alg': 'RS256',
-        'n': long_to_base64(numbers.n).decode('ascii'),
-        'e': long_to_base64(numbers.e).decode('ascii'),
-    }]}
-
-
 def token_for(email):
-    pem = KEY.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode('ascii')
-    now = int(time.time())
-    return jwt.encode(
-        {'sub': f'auth0|{email}', 'aud': AUDIENCE, 'iss': f'https://{DOMAIN}/',
-         'iat': now, 'exp': now + 3600, EMAIL_CLAIM: email},
-        pem, algorithm='RS256', headers={'kid': KID},
-    )
+    return auth.issue_access_token(email)[0]
+
+
+# Registered at import, before any test module sends the shared app its first
+# request: Flask refuses new routes after that.
+SEEN = {}
+
+
+def _record():
+    SEEN['email'] = auth.caller_email()
+    return {'status': 200}
+
+
+main.app.add_url_rule('/api/_probe', 'probe_caller', auth.requires_auth(_record), methods=['POST'])
 
 
 # Readable without signing in, each for a stated reason.
@@ -68,7 +48,19 @@ PUBLIC = {
     'list_public_decks': 'the point of a public library is browsing it first',
     'get_image': 'pictures inside a shared deck load for a signed-out viewer',
     'handle_auth_error': 'an error handler, not a route',
+    # Signing in is how a caller gets a token, so it cannot require one.
+    'accounts.signup': 'creating an account',
+    'accounts.verify': 'following the emailed activation link',
+    'accounts.resend_verification': 'asking for a new activation link',
+    'accounts.login': 'signing in',
+    'accounts.refresh': 'swapping a refresh token for a new access token',
+    'accounts.logout': 'revoking a refresh token',
+    'accounts.forgot_password': 'asking for a password reset link',
+    'accounts.reset_password': 'following the emailed reset link',
 }
+
+# Of those, the ones that never read a bearer token at all.
+SIGN_IN = {name for name in PUBLIC if name.startswith('accounts.')}
 
 # Placeholder values for path parameters.
 PATH_VALUES = {
@@ -93,23 +85,16 @@ def iter_routes():
 class ApiAuthTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        auth._fetch_jwks = _jwks
         # Past the decorator, every route should fail on the database rather
         # than reach for a real one.
         main.flashcards_collection = None
         main.shares_collection = None
         main.images = None
+        import accounts
+        accounts.users = None
+        accounts.sessions = None
 
-        # Registered before the first request: Flask refuses new routes after.
-        cls.seen = {}
-
-        def record():
-            cls.seen['email'] = auth.caller_email()
-            return {'status': 200}
-
-        main.app.add_url_rule(
-            '/api/_probe', 'probe_caller', auth.requires_auth(record), methods=['POST'])
-
+        cls.seen = SEEN
         cls.client = main.app.test_client()
 
     def _call(self, method, path, headers=None, body=None):
@@ -190,7 +175,7 @@ class ApiAuthTestCase(unittest.TestCase):
     def test_public_routes_still_reject_a_broken_token(self):
         """An expired session must not be mistaken for a signed-out visitor."""
         for endpoint, method, path in iter_routes():
-            if endpoint not in PUBLIC or endpoint == 'handle_auth_error':
+            if endpoint not in PUBLIC or endpoint == 'handle_auth_error' or endpoint in SIGN_IN:
                 continue
             with self.subTest(endpoint=endpoint, method=method):
                 response = self._call(method, path, headers={'Authorization': 'Bearer junk'})

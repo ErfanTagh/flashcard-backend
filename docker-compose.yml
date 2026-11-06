@@ -23,6 +23,12 @@ services:
             - MONGO_DATABASE=flashcards
             - MONGO_USERNAME=admin
             - MONGO_PASSWORD=password
+            # Sessions are signed with this; set it in .env (openssl rand -base64 48).
+            - JWT_SECRET=${JWT_SECRET:-}
+            - APP_URL=${APP_URL:-http://localhost:3000}
+            - MAILGUN_API_KEY=${MAILGUN_API_KEY:-}
+            - MAILGUN_DOMAIN=${MAILGUN_DOMAIN:-}
+            - MAILGUN_API_BASE=${MAILGUN_API_BASE:-https://api.mailgun.net}
         depends_on:
             - mongodb
         networks:
@@ -33,10 +39,6 @@ services:
     frontend:
         build:
             context: ../flashcard-frontend
-            args:
-                - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
-                - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
-                - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
         container_name: flashcard-frontend
         ports:
             - "3000:80"

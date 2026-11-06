@@ -13,6 +13,7 @@ from pymongo import MongoClient
 # Identity comes from a verified Auth0 token, never from a request parameter.
 from auth import AuthError, caller_email, optional_auth, requires_auth
 import ai_generate
+import accounts
 
 app = Flask(__name__)
 
@@ -40,6 +41,8 @@ try:
     images = gridfs.GridFS(db)
     # One document per shared collection; see the sharing section below.
     shares_collection = db.shares
+    # Local accounts (accounts.py): users and their sessions, same database.
+    accounts.init(db)
     print(f"Connected to MongoDB at {mongo_host}:{mongo_port}")
 except Exception as e:
     print(f"Error connecting to MongoDB: {e}")
@@ -214,6 +217,9 @@ def handle_auth_error(ex):
     response = jsonify(ex.error)
     response.status_code = ex.status_code
     return response
+
+
+app.register_blueprint(accounts.bp)
 
 
 @app.route('/api/words', methods=['GET'])

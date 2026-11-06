@@ -23,11 +23,15 @@ services:
             - MONGO_DATABASE=flashcards
             - MONGO_USERNAME=admin
             - MONGO_PASSWORD=password
-            # Local development has no Auth0 round trip, so the frontend sends
-            # the signed-in address in an X-Dev-User header instead of a token.
-            # The API honours that header only because of this switch, and
-            # refuses to honour it at all when FLASK_ENV says production. It
-            # must never be set on the server.
+            # Real local accounts in dev too. With no MAILGUN_*/SMTP_* set,
+            # verification and reset emails are printed to this container's
+            # log instead of sent: `docker logs flashcard-backend` for the link.
+            # JWT_SECRET unset means a random key per start (sessions end on
+            # restart), which is fine locally.
+            - APP_URL=${APP_URL:-http://localhost:3001}
+            # Still honoured for scripts like share-scenarios.sh that name a
+            # user with X-Dev-User; refused outright when FLASK_ENV says
+            # production. It must never be set on the server.
             - RECALLCARDS_DEV_AUTH=true
             # AI deck generation (/api/generate-cards). Export ANTHROPIC_API_KEY
             # in your shell before `docker compose up` to try it locally; left
@@ -44,17 +48,10 @@ services:
         build:
             context: ../flashcard-frontend
             dockerfile: Dockerfile.dev
-            args:
-                - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
-                - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
-                - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
         container_name: flashcard-frontend-dev
         ports:
             - "3001:3001"
         environment:
-            - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
-            - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
-            - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
             # A bind mount from macOS delivers no filesystem events into the
             # container, so Tailwind never re-scans an edited file and classes
             # added since the server started are simply never generated -- the

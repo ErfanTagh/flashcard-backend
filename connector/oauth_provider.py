@@ -2,8 +2,8 @@
 MCP OAuthAuthorizationServerProvider for RecallCards.
 
 Claude registers as a client (DCR), then authorize() sends the browser to
-/connector/login, which bounces through Auth0. When Auth0 returns the user's
-verified email, complete_login() mints the authorization code Claude exchanges
+/connector/login, where the user signs in with their RecallCards account. Once
+the API accepts the password, complete_login() mints the authorization code Claude exchanges
 for tokens. The token's `subject` is the user's email -- the same identity the
 REST API scopes every operation to.
 
@@ -157,7 +157,7 @@ class RecallcardsOAuthProvider(
         await _to_thread(ost.revoke_by_token, token.token)
 
     async def complete_login(self, login_state: str, subject: str) -> str:
-        """After Auth0 returns the user's email: mint the auth code and return
+        """After the API accepts the sign-in: mint the auth code and return
         the URL that sends the browser back to Claude."""
         payload = await _to_thread(ost.pop_login_state, login_state)
         if not payload:

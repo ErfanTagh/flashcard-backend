@@ -1,6 +1,6 @@
 """
 Mongo persistence for the connector's OAuth (DCR clients, auth codes, tokens,
-and the pending-login state that carries a user through the Auth0 round trip).
+and the pending-login state that carries a user through the sign-in form).
 
 Access and refresh tokens are stored hashed; raw tokens are never logged. Rows
 live in the same RecallCards database as everything else, in their own
@@ -75,7 +75,7 @@ def get_client(client_id: str) -> dict[str, Any] | None:
     return _db().connector_oauth_clients.find_one({"client_id": client_id}, {"_id": 0})
 
 
-# --- Pending login (authorize -> /connector/login -> Auth0 -> /done) ------
+# --- Pending login (authorize -> /connector/login form -> back to Claude) --
 
 def save_login_state(payload: dict[str, Any]) -> str:
     state = secrets.token_urlsafe(24)
@@ -218,17 +218,17 @@ def rotate_refresh(old_refresh: str) -> tuple[str, str, int] | None:
     )
 
 
-# --- Auth0 sessions (the user's API token, kept to call the REST API) --------
+# --- API sessions (the user's API token, kept to call the REST API) ----------
 #
-# After the Auth0 login the connector holds an access token for the RecallCards
-# API (audience "recallcards") and a refresh token to renew it. These are stored
-# usable (not hashed) because they are replayed against Auth0 and the API, the
+# After the sign-in the connector holds an access token for the RecallCards
+# API and a refresh token to renew it. These are stored
+# usable (not hashed) because they are replayed against the API, the
 # way any confidential OAuth client keeps a refresh token. Keyed by email, which
 # is the identity the MCP token carries.
 
-def save_auth0_session(email: str, *, access_token: str, refresh_token: str | None,
-                       expires_at: float) -> None:
-    _db().connector_auth0_sessions.update_one(
+def save_api_session(email: str, *, access_token: str, refresh_token: str | None,
+                     expires_at: float) -> None:
+    _db().connector_api_sessions.update_one(
         {"email": email},
         {"$set": {
             "email": email,
@@ -241,13 +241,5 @@ def save_auth0_session(email: str, *, access_token: str, refresh_token: str | No
     )
 
 
-def get_auth0_session(email: str) -> dict[str, Any] | None:
-    return _db().connector_auth0_sessions.find_one({"email": email}, {"_id": 0})
-
-
-def update_auth0_access(email: str, *, access_token: str, expires_at: float) -> None:
-    _db().connector_auth0_sessions.update_one(
-        {"email": email},
-        {"$set": {"access_token": access_token, "expires_at": expires_at,
-                  "updated_at": datetime.utcnow()}},
-    )
+def get_api_session(email: str) -> dict[str, Any] | None:
+    return _db().connector_api_sessions.find_one({"email": email}, {"_id": 0})

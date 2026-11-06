@@ -3,26 +3,20 @@
 Every data route used to take the caller's identity as an argument: `email=` in
 a query string, or a field named `token` that in fact held the address. Nothing
 verified it, so knowing an address was the same as owning the account. These
-helpers replace that: the caller presents an Auth0 access token, the signature
-is checked against Auth0's published keys, and the address comes out of the
-verified token. A client-supplied address is then worth nothing.
+helpers replace that: the caller presents an access token this API issued
+itself (see accounts.py), the signature is checked, and the address comes out
+of the verified token. A client-supplied address is then worth nothing.
 
-The address is not in the access token by default. Auth0 puts the user id in
-`sub`; `email` only appears if a custom claim adds it. Both paths are supported
--- a claim if one is configured, otherwise one `/userinfo` call per token,
-cached for as long as the token is valid -- so this works whether or not the
-Auth0 tenant has been given an action.
+Access tokens are short-lived HS256 JWTs signed with JWT_SECRET. They carry the
+address in `sub`, so verifying one needs no database or network call. Sessions
+outlive them through refresh tokens, which accounts.py stores and rotates.
 """
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
-import threading
+import secrets
 import time
-import urllib.error
-import urllib.request
 
 from functools import wraps
 
@@ -31,17 +25,30 @@ from jose import jwt
 
 logger = logging.getLogger(__name__)
 
-AUTH0_DOMAIN = os.environ.get('AUTH0_DOMAIN', 'dev-43bumhcy.us.auth0.com')
-API_AUDIENCE = os.environ.get('AUTH0_AUDIENCE', 'recallcards')
-ALGORITHMS = ['RS256']
+ALGORITHM = 'HS256'
+ISSUER = os.environ.get('AUTH_ISSUER', 'recallcards')
+AUDIENCE = os.environ.get('AUTH_AUDIENCE', 'recallcards-api')
+ACCESS_TOKEN_TTL = int(os.environ.get('ACCESS_TOKEN_TTL', str(60 * 60)))
 
-# An Auth0 action can add the address to the access token under a namespaced
-# claim. If one is configured there is no /userinfo round trip at all.
-EMAIL_CLAIM = os.environ.get('AUTH0_EMAIL_CLAIM', 'https://recallcards.net/email')
 
-HTTP_TIMEOUT = float(os.environ.get('AUTH0_HTTP_TIMEOUT', '5'))
-JWKS_TTL = float(os.environ.get('AUTH0_JWKS_TTL', '3600'))
-USERINFO_TTL = float(os.environ.get('AUTH0_USERINFO_TTL', '3600'))
+def _is_production():
+    return os.environ.get('FLASK_ENV', '').strip().lower() == 'production'
+
+
+def _load_secret():
+    secret = os.environ.get('JWT_SECRET', '').strip()
+    if secret:
+        if len(secret) < 32:
+            raise RuntimeError('JWT_SECRET must be at least 32 characters.')
+        return secret
+    if _is_production():
+        # Refuse to start rather than sign tokens with a key nobody chose.
+        raise RuntimeError('JWT_SECRET must be set in production.')
+    logger.warning('JWT_SECRET is not set; using a random key. Sessions end when the server restarts.')
+    return secrets.token_urlsafe(48)
+
+
+JWT_SECRET = _load_secret()
 
 # Local development only. With this set, an unauthenticated request may name
 # its own user, which is exactly the hole this module exists to close -- so it
@@ -63,77 +70,35 @@ def _unauthorized(code, description):
     return AuthError({'code': code, 'description': description}, 401)
 
 
-# --- Auth0's signing keys -------------------------------------------------
-#
-# Fetched once and kept. The previous implementation fetched the key set on
-# every single request, with no timeout: a request to this API could not be
-# served faster than a round trip to Auth0, and an Auth0 slowdown became an
-# outage here.
+# --- Tokens ---------------------------------------------------------------
 
-_jwks_lock = threading.Lock()
-_jwks_cache: dict | None = None
-_jwks_fetched_at = 0.0
-
-
-def _fetch_jwks():
-    url = f'https://{AUTH0_DOMAIN}/.well-known/jwks.json'
-    with urllib.request.urlopen(url, timeout=HTTP_TIMEOUT) as response:
-        return json.loads(response.read())
-
-
-def _jwks(force_refresh=False):
-    global _jwks_cache, _jwks_fetched_at
-
-    with _jwks_lock:
-        fresh = _jwks_cache is not None and (time.monotonic() - _jwks_fetched_at) < JWKS_TTL
-        if fresh and not force_refresh:
-            return _jwks_cache
-
-        try:
-            _jwks_cache = _fetch_jwks()
-            _jwks_fetched_at = time.monotonic()
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            # Serve a stale key set rather than locking every user out over a
-            # blip: the keys rotate on the order of months.
-            if _jwks_cache is not None:
-                logger.warning('could not refresh Auth0 JWKS (%s), using cached keys', exc)
-                return _jwks_cache
-            raise _unauthorized('jwks_unavailable', 'Could not reach the identity provider.')
-
-        return _jwks_cache
-
-
-def _signing_key(token):
-    try:
-        header = jwt.get_unverified_header(token)
-    except Exception:
-        raise _unauthorized('invalid_header', 'The token could not be read.')
-
-    kid = header.get('kid')
-    if not kid:
-        raise _unauthorized('invalid_header', 'The token names no signing key.')
-
-    # An unknown kid most likely means the keys rotated since the last fetch,
-    # so look again once before giving up.
-    for force_refresh in (False, True):
-        for key in _jwks(force_refresh).get('keys', []):
-            if key.get('kid') == kid:
-                return {k: key[k] for k in ('kty', 'kid', 'use', 'n', 'e') if k in key}
-
-    raise _unauthorized('invalid_header', 'The token was signed by an unknown key.')
+def issue_access_token(email, now=None):
+    """A signed access token for a verified account. Returns (token, expires_in)."""
+    now = int(now if now is not None else time.time())
+    claims = {
+        'sub': email,
+        'email': email,
+        'typ': 'access',
+        'iss': ISSUER,
+        'aud': AUDIENCE,
+        'iat': now,
+        'exp': now + ACCESS_TOKEN_TTL,
+    }
+    return jwt.encode(claims, JWT_SECRET, algorithm=ALGORITHM), ACCESS_TOKEN_TTL
 
 
 def verify_access_token(token):
     """Return the verified claims, or raise AuthError."""
-    key = _signing_key(token)
     try:
-        return jwt.decode(
-            token,
-            key,
-            algorithms=ALGORITHMS,
-            audience=API_AUDIENCE,
-            issuer=f'https://{AUTH0_DOMAIN}/',
-        )
+        header = jwt.get_unverified_header(token)
+    except Exception:
+        raise _unauthorized('invalid_header', 'The token could not be read.')
+    # Pinned below as well; checked here so the reason is clear.
+    if header.get('alg') != ALGORITHM:
+        raise _unauthorized('invalid_header', 'The token uses an unexpected algorithm.')
+
+    try:
+        claims = jwt.decode(token, JWT_SECRET, algorithms=[ALGORITHM], audience=AUDIENCE, issuer=ISSUER)
     except jwt.ExpiredSignatureError:
         raise _unauthorized('token_expired', 'The token has expired.')
     except jwt.JWTClaimsError:
@@ -141,57 +106,19 @@ def verify_access_token(token):
     except Exception:
         raise _unauthorized('invalid_token', 'The token could not be verified.')
 
-
-# --- The address behind a token -------------------------------------------
-
-_userinfo_lock = threading.Lock()
-_userinfo_cache: dict[str, tuple[str, float]] = {}
+    if claims.get('typ') != 'access':
+        raise _unauthorized('invalid_token', 'This is not an access token.')
+    return claims
 
 
-def _userinfo_email(token, claims):
-    """Ask Auth0 for the address, once per token."""
-    cache_key = hashlib.sha256(token.encode('utf-8')).hexdigest()
-    now = time.time()
-
-    with _userinfo_lock:
-        cached = _userinfo_cache.get(cache_key)
-        if cached and cached[1] > now:
-            return cached[0]
-
-    request_obj = urllib.request.Request(
-        f'https://{AUTH0_DOMAIN}/userinfo',
-        headers={'Authorization': f'Bearer {token}'},
-    )
-    try:
-        with urllib.request.urlopen(request_obj, timeout=HTTP_TIMEOUT) as response:
-            profile = json.loads(response.read())
-    except (urllib.error.URLError, OSError, ValueError) as exc:
-        logger.warning('could not resolve the caller address via /userinfo: %s', exc)
-        raise _unauthorized('email_unavailable', 'Could not establish who the token belongs to.')
-
-    email = (profile.get('email') or '').strip().lower()
-    if not email:
+def email_from_claims(claims):
+    email = claims.get('sub')
+    if not isinstance(email, str) or not email.strip():
         raise _unauthorized('email_missing', 'The token carries no email address.')
-
-    # Never outlive the token itself, and never cache for longer than the TTL.
-    expiry = min(float(claims.get('exp', now + USERINFO_TTL)), now + USERINFO_TTL)
-    with _userinfo_lock:
-        _userinfo_cache[cache_key] = (email, expiry)
-        if len(_userinfo_cache) > 2048:
-            for stale_key in [k for k, (_, exp) in _userinfo_cache.items() if exp <= now]:
-                _userinfo_cache.pop(stale_key, None)
-
-    return email
+    return email.strip().lower()
 
 
-def email_from_claims(claims, token):
-    """The caller's address: a custom claim if the tenant sets one, else /userinfo."""
-    for field in (EMAIL_CLAIM, 'email'):
-        value = claims.get(field)
-        if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    return _userinfo_email(token, claims)
-
+# --- The caller -------------------------------------------------------------
 
 def _bearer_token():
     header = request.headers.get('Authorization', '')
@@ -208,7 +135,7 @@ def _dev_email():
     """The address a local developer is pretending to be, if that is switched on."""
     if not DEV_AUTH_BYPASS:
         return None
-    if os.environ.get('FLASK_ENV', '').strip().lower() == 'production':
+    if _is_production():
         logger.error('RECALLCARDS_DEV_AUTH is set in a production environment; ignoring it')
         return None
 
@@ -226,7 +153,7 @@ def resolve_caller():
     """The verified address of the caller, or None when they present nothing."""
     token = _bearer_token()
     if token:
-        return email_from_claims(verify_access_token(token), token)
+        return email_from_claims(verify_access_token(token))
     return _dev_email()
 
 

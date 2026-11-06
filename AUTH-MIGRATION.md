@@ -1,3 +1,28 @@
+# Accounts are now local (Auth0 removed)
+
+Sign-in no longer goes through Auth0. `accounts.py` keeps users in the same
+MongoDB as the cards (`users`, `auth_sessions`) and issues its own tokens;
+`auth.py` verifies them. Everything below about *which routes need a token* is
+unchanged; the parts about Auth0 keys, `/userinfo` and the email claim are
+history.
+
+- Sign up -> an activation link is emailed (Mailgun, `mailer.py`) -> following
+  it activates the account and signs the user in. Unactivated accounts cannot
+  sign in. Forgot-password works the same way and also activates.
+- Access tokens: HS256, 1 hour, signed with `JWT_SECRET`. Refresh tokens: 60
+  days, stored hashed, single use, rotated on every refresh.
+- Existing users sign up again with the same address. Cards are keyed by email,
+  so once the address is confirmed their decks are there.
+- The Claude connector shows its own email/password form on `/connector/login`.
+  Everyone has to reconnect it once.
+- The iOS app signs in natively, so it needs a new build.
+
+Server `.env` needs: `JWT_SECRET` (`openssl rand -base64 48`), `MAILGUN_API_KEY`,
+`MAILGUN_DOMAIN`, `MAIL_FROM` on that domain, and `MAILGUN_API_BASE` for an EU
+domain. See `docker-compose.prod.yml`.
+
+---
+
 # The API now checks who is calling
 
 Until this change, `requires_auth` was applied to exactly one route,

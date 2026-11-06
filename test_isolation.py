@@ -9,61 +9,28 @@ Needs mongomock: pip install mongomock
 Run with: python test_isolation.py
 """
 import os
-import time
 import unittest
 
 import mongomock
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from jose import jwt
-from jose.utils import long_to_base64
-
-DOMAIN = 'test-tenant.auth0.com'
-AUDIENCE = 'recallcards'
-EMAIL_CLAIM = 'https://recallcards.net/email'
-
-os.environ['AUTH0_DOMAIN'] = DOMAIN
-os.environ['AUTH0_AUDIENCE'] = AUDIENCE
-os.environ['AUTH0_EMAIL_CLAIM'] = EMAIL_CLAIM
+os.environ['JWT_SECRET'] = 'test-secret-' + 'x' * 40
 os.environ.pop('RECALLCARDS_DEV_AUTH', None)
+# Keep PyMongo from trying to reach a server during import.
+os.environ.setdefault('MONGO_HOST', 'localhost')
 
 import auth  # noqa: E402
 import main  # noqa: E402
-
-KEY = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-KID = 'test-key-1'
 
 ALICE = 'alice@example.com'
 BOB = 'bob@example.com'
 
 
-def _jwks():
-    n = KEY.public_key().public_numbers()
-    return {'keys': [{
-        'kty': 'RSA', 'kid': KID, 'use': 'sig', 'alg': 'RS256',
-        'n': long_to_base64(n.n).decode('ascii'),
-        'e': long_to_base64(n.e).decode('ascii'),
-    }]}
-
-
 def token_for(email):
-    pem = KEY.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode('ascii')
-    now = int(time.time())
-    return jwt.encode(
-        {'sub': f'auth0|{email}', 'aud': AUDIENCE, 'iss': f'https://{DOMAIN}/',
-         'iat': now, 'exp': now + 3600, EMAIL_CLAIM: email},
-        pem, algorithm='RS256', headers={'kid': KID},
-    )
+    return auth.issue_access_token(email)[0]
 
 
 class IsolationTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        auth._fetch_jwks = _jwks
         cls.client = main.app.test_client()
 
     def setUp(self):

@@ -36,10 +36,20 @@ services:
       - MONGO_DATABASE=${MONGO_DATABASE:-flashcards}
       - MONGO_USERNAME=${MONGO_USERNAME:-admin}
       - MONGO_PASSWORD=${MONGO_PASSWORD:?set MONGO_PASSWORD in .env}
-      # Who the API trusts tokens from. auth.py defaults to these, but set them
-      # explicitly so a tenant change is one edit here.
-      - AUTH0_DOMAIN=${AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
-      - AUTH0_AUDIENCE=${AUTH0_AUDIENCE:-recallcards}
+      # Local accounts (accounts.py). JWT_SECRET signs every session token: a
+      # long random string, kept only in .env on the box. The API refuses to
+      # start in production without it. Changing it signs everyone out.
+      - JWT_SECRET=${JWT_SECRET:?set JWT_SECRET in .env (openssl rand -base64 48)}
+      # Where the links in verification and reset emails point.
+      - APP_URL=${APP_URL:-https://recallcards.net}
+      # Account email through Mailgun's HTTP API. Use MAILGUN_API_BASE=
+      # https://api.eu.mailgun.net for a domain in Mailgun's EU region.
+      # (Alternatively set SMTP_HOST/SMTP_PORT/SMTP_USERNAME/SMTP_PASSWORD for
+      # Mailgun's SMTP relay, smtp.mailgun.org:587.)
+      - MAILGUN_API_KEY=${MAILGUN_API_KEY:?set MAILGUN_API_KEY in .env}
+      - MAILGUN_DOMAIN=${MAILGUN_DOMAIN:?set MAILGUN_DOMAIN in .env}
+      - MAILGUN_API_BASE=${MAILGUN_API_BASE:-https://api.mailgun.net}
+      - MAIL_FROM=${MAIL_FROM:-RecallCards <no-reply@recallcards.net>}
       # Production. This alone makes the dev-auth bypass refuse to run even if
       # the next line were ever added by mistake.
       - FLASK_ENV=production
@@ -58,10 +68,6 @@ services:
     build:
       context: ../flashcard-frontend
       dockerfile: Dockerfile
-      args:
-        - VITE_AUTH0_DOMAIN=${VITE_AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
-        - VITE_AUTH0_CLIENT_ID=${VITE_AUTH0_CLIENT_ID:-k9q4k2SI9OuxDAh8YY6ykLMnEK3Bq44u}
-        - VITE_AUTH0_AUDIENCE=${VITE_AUTH0_AUDIENCE:-recallcards}
     container_name: recallcards-frontend
     restart: always
     # No ports here either. The gateway proxies to recallcards-frontend:80 over
@@ -87,13 +93,8 @@ services:
       - MONGO_DATABASE=${MONGO_DATABASE:-flashcards}
       - MONGO_USERNAME=${MONGO_USERNAME:-admin}
       - MONGO_PASSWORD=${MONGO_PASSWORD:?set MONGO_PASSWORD in .env}
-      # Auth0: the connector signs users in through Auth0 and gets an API token.
-      - AUTH0_DOMAIN=${AUTH0_DOMAIN:-dev-43bumhcy.us.auth0.com}
-      - CONNECTOR_AUTH0_AUDIENCE=${AUTH0_AUDIENCE:-recallcards}
-      # Empty until the Auth0 connector app exists; the server boots and serves
-      # OAuth metadata, and only the login step needs these.
-      - CONNECTOR_AUTH0_CLIENT_ID=${CONNECTOR_AUTH0_CLIENT_ID:-}
-      - CONNECTOR_AUTH0_CLIENT_SECRET=${CONNECTOR_AUTH0_CLIENT_SECRET:-}
+      # Users sign in with their RecallCards account on /connector/login; the
+      # connector passes the password to the API and keeps only its tokens.
       # Public identity + where the API lives on the network.
       - CONNECTOR_PUBLIC_URL=https://recallcards.net
       - CONNECTOR_SITE_URL=https://recallcards.net

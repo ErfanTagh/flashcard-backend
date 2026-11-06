@@ -2,11 +2,11 @@
 The connector's data layer: a thin client over the RecallCards REST API.
 
 Every operation calls the same endpoints the website calls, with the signed-in
-user's Auth0 access token, so the API does the authorization and scoping and the
+user's API access token, so the API does the authorization and scoping and the
 connector never reimplements (or drifts from) the site's logic.
 
-The Auth0 access token lasts about an hour; when it is close to expiry the stored
-refresh token renews it. All calls here are synchronous (urllib) and are invoked
+The access token lasts about an hour; when it is close to expiry the stored
+refresh token renews it (POST /api/auth/refresh, which rotates it). All calls here are synchronous (urllib) and are invoked
 from the MCP server in a worker thread.
 """
 from __future__ import annotations
@@ -23,9 +23,6 @@ from connector import oauth_store as ost
 
 API_URL = os.getenv("CONNECTOR_API_URL", "http://recallcards-backend:5000").rstrip("/")
 PUBLIC_URL = os.getenv("CONNECTOR_PUBLIC_URL", "https://recallcards.net").rstrip("/")
-AUTH0_DOMAIN = os.getenv("AUTH0_DOMAIN", "")
-CLIENT_ID = os.getenv("CONNECTOR_AUTH0_CLIENT_ID", "")
-CLIENT_SECRET = os.getenv("CONNECTOR_AUTH0_CLIENT_SECRET", "")
 
 
 class ConnectorError(Exception):
@@ -36,16 +33,11 @@ class ConnectorError(Exception):
 # --- the user's API token -------------------------------------------------
 
 def _refresh_access(email: str, refresh_token: str) -> str | None:
-    body = urllib.parse.urlencode({
-        "grant_type": "refresh_token",
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "refresh_token": refresh_token,
-    }).encode("ascii")
     req = urllib.request.Request(
-        f"https://{AUTH0_DOMAIN}/oauth/token",
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        f"{API_URL}/api/auth/refresh",
+        data=json.dumps({"refresh_token": refresh_token}).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -55,18 +47,15 @@ def _refresh_access(email: str, refresh_token: str) -> str | None:
     access = tokens.get("access_token")
     if not access:
         return None
-    ost.update_auth0_access(email, access_token=access,
-                            expires_at=time.time() + int(tokens.get("expires_in") or 3600))
-    # Auth0 may rotate the refresh token.
-    if tokens.get("refresh_token"):
-        ost.save_auth0_session(email, access_token=access,
-                               refresh_token=tokens["refresh_token"],
-                               expires_at=time.time() + int(tokens.get("expires_in") or 3600))
+    # Refresh tokens are single use: keep the new one or the next refresh fails.
+    ost.save_api_session(email, access_token=access,
+                         refresh_token=tokens.get("refresh_token") or refresh_token,
+                         expires_at=time.time() + int(tokens.get("expires_in") or 3600))
     return access
 
 
 def _access_token(email: str) -> str:
-    session = ost.get_auth0_session(email)
+    session = ost.get_api_session(email)
     if not session:
         raise ConnectorError("Your session has ended. Reconnect RecallCards in Claude's connector settings.")
     if session.get("expires_at", 0) > time.time() + 30:

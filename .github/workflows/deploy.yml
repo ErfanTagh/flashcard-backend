@@ -30,7 +30,7 @@ jobs:
             cd "$APP"
 
             # Match the repo exactly. Never `git clean`: it would delete the
-            # untracked .env that holds the Mongo password and Auth0 config.
+            # untracked .env that holds the Mongo password, JWT_SECRET and Mailgun keys.
             git fetch origin
             git reset --hard origin/main || git reset --hard origin/master
 
