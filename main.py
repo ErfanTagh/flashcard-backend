@@ -1376,10 +1376,9 @@ def generate_cards_route():
         ))
 
     user_prompt = request.form.get('prompt', '')
-    count = request.form.get('count')
 
     try:
-        result = ai_generate.generate_cards(files, user_prompt=user_prompt, count=count)
+        result = ai_generate.generate_cards(files, user_prompt=user_prompt)
     except ai_generate.GenerationError as error:
         return jsonify({"status": 400, "error": str(error)}), 400
     except Exception:

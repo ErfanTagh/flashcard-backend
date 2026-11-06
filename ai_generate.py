@@ -33,10 +33,11 @@ MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-opus-5-5")
 # Streaming (below) is what keeps a ceiling this high from risking a timeout.
 MAX_OUTPUT_TOKENS = 32000
 
-# How many cards a single request may ask for. A person studying does not want
-# four hundred cards from one upload, and each card is output tokens we pay for.
+# The model decides how many cards the material warrants; this is only a
+# ceiling it is told to stay within, and a hard cap enforced on the result, so
+# a large upload cannot turn into hundreds of cards (and the output tokens that
+# would cost).
 MAX_CARDS = 50
-DEFAULT_CARDS = 10
 
 # What a file may be. Images and PDFs go to the model as-is; text is read and
 # passed as text. Anything else is refused with a message naming what works.
@@ -65,16 +66,6 @@ MAX_TEXT_CHARS = 100_000
 
 class GenerationError(Exception):
     """Something the caller should show the user, not a server fault."""
-
-
-def _effective_count(requested):
-    try:
-        count = int(requested)
-    except (TypeError, ValueError):
-        return DEFAULT_CARDS
-    if count < 1:
-        return DEFAULT_CARDS
-    return min(count, MAX_CARDS)
 
 
 def _image_block(data, media_type):
@@ -145,14 +136,14 @@ def _file_to_block(name, media_type, data):
     )
 
 
-def _instruction(count, user_prompt):
+def _instruction(user_prompt):
     """The text block that tells the model what deck to make of the material."""
     lines = [
         "Create a flashcard deck from the material above.",
-        f"Make {count} cards" + (
-            " (or fewer if the material genuinely does not support that many)."
-            if count > 1 else "."
-        ),
+        "Decide how many cards the material warrants: enough to cover the key "
+        "points a learner should take away, with no padding and no trivia. A "
+        "short note makes a handful of cards; a dense chapter makes many. Use "
+        f"as many or as few as the content genuinely supports, up to {MAX_CARDS}.",
     ]
     if (user_prompt or "").strip():
         # The user's own words, fenced so the model treats them as instructions
@@ -262,7 +253,7 @@ def _cards_from(payload):
     return name, cards
 
 
-def generate_cards(files, user_prompt="", count=DEFAULT_CARDS):
+def generate_cards(files, user_prompt=""):
     """Generate a deck from uploaded files.
 
     `files` is a list of (filename, media_type, bytes). Returns
@@ -302,8 +293,7 @@ def generate_cards(files, user_prompt="", count=DEFAULT_CARDS):
     if not content:
         raise GenerationError("Those files were empty.")
 
-    count = _effective_count(count)
-    content.append({"type": "text", "text": _instruction(count, user_prompt)})
+    content.append({"type": "text", "text": _instruction(user_prompt)})
 
     client = anthropic.Anthropic()
     try:
@@ -339,4 +329,5 @@ def generate_cards(files, user_prompt="", count=DEFAULT_CARDS):
 
     payload = _extract_json(text)
     name, cards = _cards_from(payload)
-    return {"name": name, "cards": cards}
+    # The model is asked to stay within the ceiling; enforce it regardless.
+    return {"name": name, "cards": cards[:MAX_CARDS]}
